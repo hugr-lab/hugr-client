@@ -3,7 +3,7 @@ name = "hugr-client"
 version = "0.1.0"
 description = "Python client for Hugr Arrow IPC over multipart/mixed"
 authors = [
-    { name = "Your Name", email = "you@example.com" }
+    { name = "Hugr-lab", email = "gribanov.vladimir@gmail.com" }
 ]
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -18,7 +18,7 @@ dependencies = [
     "requests_toolbelt",
     "numpy",
     "shapely",
-    "kepler.gl",
+    "keplergl",
     "pydeck",
 ]
 
