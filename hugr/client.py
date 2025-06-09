@@ -31,7 +31,10 @@ class HugrIPCTable:
         self.path = path
         self._geom_fields = geom_fields
         self.is_geo = is_geo
-        self._df = pa.Table.from_batches(batches).to_pandas()
+        if len(batches) != 0:
+            self._df = pa.Table.from_batches(batches).to_pandas()
+        else:
+            self._df = pd.DataFrame()
         # Decode first level geometry fields
         if is_geo:
             for field, fi in geom_fields.items():
@@ -395,7 +398,12 @@ class HugrIPCResponse:
             path = headers.get("X-Hugr-Path")
             part_type = headers.get("X-Hugr-Part-Type")
             format = headers.get("X-Hugr-Format")
+            if part_type == "error":
+                raise ValueError(f"Error in part {path}: {part.content.decode()}")
             if format == "table":
+                if headers.get("X-Hugr-Empty", "false") == "true":
+                    parts[path] = HugrIPCTable(path, [], {}, False)
+                    continue
                 reader = pa.ipc.open_stream(io.BytesIO(part.content))
                 batches = list(reader)
                 geom_fields = json.loads(headers.get("X-Hugr-Geometry-Fields", "{}"))

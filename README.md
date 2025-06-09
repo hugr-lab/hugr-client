@@ -1,5 +1,9 @@
 # This is a python client for the Hugr IPC protocol
 
+The `hugr` is a Data Mesh platform that allows you to query and explore data from various sources in a unified way. It provides a GraphQL interface to access data from different data sources, such as databases, APIs, and files. The `hugr-client` is a Python client for the Hugr platform that allows you to query data from the Hugr server and process it in a Pythonic way.
+
+For more information about the Hugr platform, please visit the [Hugr website](https://hugr-lab.github.io) or the [Hugr GitHub repository](https://github.com/hugr-lab/hugr).
+
 The client can request from the hugr and process them in a pythonic way. For the effective data transmission, the client uses the [hugr ipc protocol](https://github.com/hugr-lab/query-engine/blob/main/hugr-ipc.md) to communicate with the server.
 
 ## Installation

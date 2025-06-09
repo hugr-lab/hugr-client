@@ -1,6 +1,6 @@
 [project]
 name = "hugr-client"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python client for Hugr Arrow IPC over multipart/mixed"
 authors = [
     { name = "Hugr-lab", email = "gribanov.vladimir@gmail.com" }
