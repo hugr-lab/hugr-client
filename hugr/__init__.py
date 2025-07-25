@@ -8,6 +8,14 @@ from .client import (
     explore_map,
 )
 
+from .stream import (
+    HugrStreamConnection,
+    HugrStreamingClient,
+    HugrStream,
+    connect_stream,
+    new_stream_connection,
+)
+
 __all__ = [
     "HugrClient",
     "HugrIPCResponse",
@@ -16,6 +24,11 @@ __all__ = [
     "connect",
     "query",
     "explore_map",
+    "HugrStreamConnection",
+    "HugrStreamingClient",
+    "HugrStream",
+    "connect_stream",
+    "new_stream_connection",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

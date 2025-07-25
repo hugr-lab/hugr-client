@@ -131,6 +131,123 @@ hugr.query(
 )
 ```
 
+## Streaming API
+
+In addition to standard HTTP queries, `hugr-client` supports asynchronous streaming of data via WebSocket. This allows you to receive large datasets in batches or row-by-row, without waiting for the entire result to be loaded into memory.
+
+### Quick Start
+
+```python
+import asyncio
+from hugr.stream import connect_stream
+
+async def main():
+    client = connect_stream("http://localhost:15001/ipc")
+
+    # HTTP query for total count
+    result = client.query("query { devices_aggregation { _rows_count } }")
+    print("Total devices:", result.record()['_rows_count'])
+
+    # Stream data in batches (Arrow RecordBatch)
+    async with await client.stream(
+        """
+        query {
+            devices {
+                id
+                name
+                geom
+            }
+        }
+        """
+    ) as stream:
+        async for batch in stream.chunks():
+            df = batch.to_pandas()
+            print("Batch:", len(df), "rows")
+
+    # Stream data row by row
+    async with await client.stream(
+        "query { devices { id name status } }"
+    ) as stream:
+        async for row in stream.rows():
+            print(row)
+
+asyncio.run(main())
+```
+
+### Main Features
+
+- **connect_stream** — create a streaming client (WebSocket).
+- **client.stream(query, variables=None)** — asynchronously get a stream of Arrow RecordBatch for a GraphQL query.
+- **stream.chunks()** — async generator for batches (RecordBatch).
+- **stream.rows()** — async generator for rows (dict).
+- **stream.to_pandas()** — collect all streamed data into a pandas.DataFrame.
+- **stream.count()** — count the number of rows in the stream.
+- **stream_data_object(data_object, fields, variables=None)** — stream a specific data object and fields.
+
+### Example: Collect DataFrame via Streaming
+
+```python
+import asyncio
+from hugr.stream import connect_stream
+
+async def main():
+    client = connect_stream("http://localhost:15001/ipc")
+    async with await client.stream(
+        "query { devices { id name geom } }"
+    ) as stream:
+        df = await stream.to_pandas()
+        print(df.head())
+
+asyncio.run(main())
+```
+
+### Example: Row-by-row Processing
+
+```python
+import asyncio
+from hugr.stream import connect_stream
+
+async def main():
+    client = connect_stream()
+    async with await client.stream(
+        "query { devices { id name status } }"
+    ) as stream:
+        async for row in stream.rows():
+            if row.get("status") == "active":
+                print("Active device:", row["name"])
+
+asyncio.run(main())
+```
+
+### Example: Query Cancellation
+
+```python
+import asyncio
+from hugr.stream import connect_stream
+
+async def main():
+    client = connect_stream()
+    async with await client.stream(
+        "query { devices { id name } }"
+    ) as stream:
+        count = 0
+        async for batch in stream.chunks():
+            count += batch.num_rows
+            if count > 1000:
+                await client.cancel_current_query()
+                break
+
+asyncio.run(main())
+```
+
+### Notes
+
+- All streaming functions are asynchronous and require `async`/`await`.
+- Dependencies: `websockets`, `pyarrow`, `pandas`.
+- You can use both a pure streaming client and an enhanced client with HTTP and WebSocket support.
+
+See more in [hugr/stream.py](hugr/stream.py) and the code examples in the source files.
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

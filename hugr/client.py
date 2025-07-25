@@ -40,6 +40,9 @@ class HugrIPCTable:
             for field, fi in geom_fields.items():
                 encoding = fi.get("format", "wkb").lower()
                 if len(field.split(".")) == 1:
+                    if encoding == "h3cell":
+                        # H3 cells are stored as strings, no decoding needed
+                        continue
                     self._df[field] = self._df[field].apply(
                         lambda x: _decode_geom(x, encoding)
                     )
@@ -357,6 +360,8 @@ def _decode_geom(val, fmt):
         return None
     if isinstance(val, BaseGeometry):
         return val
+    if fmt == "h3cell":
+        return val
     if fmt == "wkb":
         return wkb.loads(val)
     elif fmt == "geojson":
@@ -372,6 +377,8 @@ def _encode_geojson(val, fmt):
         return None
     if isinstance(val, BaseGeometry):
         return mapping(val)
+    if fmt == "h3cell":
+        return val
     if fmt == "wkb":
         return mapping(wkb.load(val))
     elif fmt == "geojson":

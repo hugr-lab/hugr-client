@@ -20,6 +20,11 @@ dependencies = [
     "shapely",
     "keplergl",
     "pydeck",
+    "folium",
+    "matplotlib",
+    "mapclassify",
+    "websockets",
+    "asyncio",
 ]
 
 [project.urls]
