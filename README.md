@@ -1,10 +1,8 @@
-# This is a python client for the Hugr IPC protocol
+# hugr-client
 
-The `hugr` is a Data Mesh platform that allows you to query and explore data from various sources in a unified way. It provides a GraphQL interface to access data from different data sources, such as databases, APIs, and files. The `hugr-client` is a Python client for the Hugr platform that allows you to query data from the Hugr server and process it in a Pythonic way.
+Python client for the [Hugr](https://hugr-lab.github.io) Data Mesh platform. Query data via GraphQL, get results as Arrow tables, pandas DataFrames, or interactive Perspective viewers.
 
-For more information about the Hugr platform, please visit the [Hugr website](https://hugr-lab.github.io) or the [Hugr GitHub repository](https://github.com/hugr-lab/hugr).
-
-The client can request from the hugr and process them in a pythonic way. For the effective data transmission, the client uses the [hugr ipc protocol](https://github.com/hugr-lab/query-engine/blob/main/hugr-ipc.md) to communicate with the server.
+Uses the [Hugr IPC protocol](https://github.com/hugr-lab/query-engine/blob/main/hugr-ipc.md) (multipart/mixed with Arrow IPC) for efficient data transfer.
 
 ## Installation
 
@@ -12,257 +10,219 @@ The client can request from the hugr and process them in a pythonic way. For the
 pip install hugr-client
 ```
 
- or
+For interactive map visualizations (KeplerGL):
 
 ```bash
-uv pip install hugr-client
+pip install hugr-client[viz]
 ```
 
-## Usage
+## Quick Start
 
 ```python
-import hugr
+from hugr import HugrClient
 
-# connect to the server
-client = hugr.Client("http://localhost:15001/ipc")
+client = HugrClient()  # reads connection from ~/.hugr/connections.json
+result = client.query("{ core { data_sources { name } } }")
 
-# query data
-data = client.query("""
-    {
-        devices {
-            id
-            name
-            geom
-            last_seen{
-                time
-                value
-            }
-        }
-        drivers {
-            id
-            name
-            devices {
-                id
-                name
-                geom
-                last_seen{
-                    time
-                    value
-                }
-            }
-        }
-        drivers_by_pk(id: "driver_id") {
-            id
-            name
-            devices {
-                id
-                name
-                geom
-                last_seen{
-                    time
-                    value
-                }
-            }
-        }
-    }
+# Interactive Perspective viewer in JupyterLab
+result
+
+# pandas DataFrame
+df = result.df("data.core.data_sources")
+
+# pyarrow Table (zero-copy, no pandas overhead)
+table = result.parts["data.core.data_sources"].to_arrow()
+```
+
+## Connection
+
+### From connections.json (recommended)
+
+When using JupyterLab with [hugr-kernel](https://github.com/hugr-lab/hugr-kernel), connections are managed via the connection manager UI. hugr-client reads the same configuration:
+
+```python
+# Default connection
+client = HugrClient()
+
+# Named connection
+client = HugrClient.from_connection("production")
+```
+
+### From environment variables
+
+```python
+# Uses HUGR_URL, HUGR_API_KEY, HUGR_TOKEN env vars
+client = HugrClient()
+```
+
+| Variable | Description |
+|----------|-------------|
+| `HUGR_URL` | Hugr server URL (e.g., `http://localhost:15000/ipc`) |
+| `HUGR_API_KEY` | API key for authentication |
+| `HUGR_TOKEN` | Bearer token for authentication |
+| `HUGR_API_KEY_HEADER` | Custom API key header name (default: `X-Hugr-Api-Key`) |
+| `HUGR_ROLE_HEADER` | Custom role header name (default: `X-Hugr-Role`) |
+| `HUGR_CONFIG_PATH` | Custom path to connections.json |
+
+### Explicit parameters
+
+```python
+client = HugrClient(
+    url="http://localhost:15000/ipc",
+    api_key="sk-...",
+    api_key_header="X-Custom-Key",  # optional custom header
+    role="analyst",
+)
+```
+
+Priority: explicit parameters > environment variables > connections.json
+
+## Working with Results
+
+### Multipart responses
+
+Hugr returns multipart responses with multiple data parts:
+
+```python
+result = client.query("""
+{
+    devices { id name geom }
+    drivers { id name }
+}
 """)
 
-# get results as a pandas dataframe
-df = data.df('data.devices') # or df = data["data.devices"].df()
+# Access individual parts
+result.parts["data.devices"].df()
+result.parts["data.drivers"].to_arrow()
 
-# get results as a geopandas dataframe
-gdf = data.gdf('data.devices', 'geom') # or gdf = data["data.devices"].gdf("geom")
-
-# if the geometry field is placed in the nested object or arrays `gdf` will flatten the data until the geometry field is found
-# field name is optional if data has only one geometry field
-gdf = data.gdf('data.drivers', 'devices.geom') # or gdf = data["data.drivers"].gdf("devices.geom")
-
-# get record as a dictionary
-d = data.record('data.iot.drivers_by_pk')
-
-# operate parts of results
-part = data["data.devices"] 
-
-# get pandas dataframe from the record
-df = data.df('data.iot.drivers_by_pk') # or df = part.df()
-
-# get geopandas dataframe from the record, dataframe will be flattened until the geometry field is found
-gdf = data.gdf('data.iot.drivers_by_pk', 'devices.geom') # or gdf = part.gdf("devices.geom") or gdf = part.gdf() if only one geometry field is present
-
-# explore geography data in the Jupyter Notebooks (labs or notebooks)
-
-data.explore_map() # or part.explore_map() or hugr.explore_map(data) or hugr.explore_map(part)
+# Display all parts (Perspective viewer in JupyterLab)
+result
 ```
 
-### Connection parameters
-
-- `url` - the url of the hugr server
-- `api_key` - the api key for the hugr server (if using api key authentication)
-- `token` - the token for the hugr server (if using token authentication)
-- `role` - the role for the hugr server (if user has a few roles in the token)
-
-It also support querying by set up connection parameters.
-
-Parameters will be passed from the environment variables:
-
-- HUGR_URL - the url of the hugr server
-- HUGR_API_KEY - the api key for the hugr server (if using api key authentication)
-- HUGR_TOKEN - the token for the hugr server (if using token authentication)
-- HUGR_API_KEY_HEADER - the header name for the api key (if using api key authentication)
-- HUGR_ROLE_HEADER - the header name for the role (if user has a few roles in the token).
+### Data access methods
 
 ```python
-import hugr
+part = result.parts["data.devices"]
 
-hugr.query(
-    query="""
-        {
-            devices {
-                id
-                name
-                geom
-                last_seen{
-                    time
-                    value
-                }
-            }
-        }
-    """
-)
+# pandas DataFrame
+df = part.df()
+
+# pyarrow Table (zero-copy)
+table = part.to_arrow()
+
+# GeoDataFrame (with geometry decoding)
+gdf = part.to_geo_dataframe("geom")
+
+# or via shortcut
+gdf = result.gdf("data.devices", "geom")
+
+# JSON record (for object parts)
+record = result.record("data.drivers_by_pk")
+```
+
+### Geometry support
+
+Geometry fields are automatically detected from server metadata. Supported formats: WKB, GeoJSON, H3Cell.
+
+```python
+# GeoDataFrame with CRS
+gdf = result.gdf("data.devices", "geom")
+print(gdf.crs)  # EPSG:4326
+
+# Nested geometry (auto-flattens to target field)
+gdf = result.gdf("data.drivers", "devices.geom")
+
+# GeoJSON export
+layers = result.geojson_layers()
+```
+
+### Interactive visualization
+
+With `hugr-client[viz]`:
+
+```python
+result.explore_map()  # KeplerGL interactive map
+```
+
+In JupyterLab with [hugr-perspective-viewer](https://github.com/hugr-lab/duckdb-kernel):
+
+```python
+result  # renders as Perspective viewer with table/map/charts
 ```
 
 ## Streaming API
 
-In addition to standard HTTP queries, `hugr-client` supports asynchronous streaming of data via WebSocket. This allows you to receive large datasets in batches or row-by-row, without waiting for the entire result to be loaded into memory.
-
-### Quick Start
+For large datasets, use WebSocket streaming to process data in batches:
 
 ```python
 import asyncio
-from hugr.stream import connect_stream
+from hugr import connect_stream
 
 async def main():
-    client = connect_stream("http://localhost:15001/ipc")
+    client = connect_stream()
 
-    # HTTP query for total count
-    result = client.query("query { devices_aggregation { _rows_count } }")
-    print("Total devices:", result.record()['_rows_count'])
-
-    # Stream data in batches (Arrow RecordBatch)
-    async with await client.stream(
-        """
-        query {
-            devices {
-                id
-                name
-                geom
-            }
-        }
-        """
-    ) as stream:
+    # Stream Arrow batches
+    async with await client.stream("{ devices { id name geom } }") as stream:
         async for batch in stream.chunks():
-            df = batch.to_pandas()
-            print("Batch:", len(df), "rows")
+            print(f"Batch: {batch.num_rows} rows")
 
-    # Stream data row by row
-    async with await client.stream(
-        "query { devices { id name status } }"
-    ) as stream:
-        async for row in stream.rows():
-            print(row)
-
-asyncio.run(main())
-```
-
-### Main Features
-
-- **connect_stream** — create a streaming client (WebSocket).
-- **client.stream(query, variables=None)** — asynchronously get a stream of Arrow RecordBatch for a GraphQL query.
-- **stream.chunks()** — async generator for batches (RecordBatch).
-- **stream.rows()** — async generator for rows (dict).
-- **stream.to_pandas()** — collect all streamed data into a pandas.DataFrame.
-- **stream.count()** — count the number of rows in the stream.
-- **stream_data_object(data_object, fields, variables=None)** — stream a specific data object and fields.
-
-### Example: Collect DataFrame via Streaming
-
-```python
-import asyncio
-from hugr.stream import connect_stream
-
-async def main():
-    client = connect_stream("http://localhost:15001/ipc")
-    async with await client.stream(
-        "query { devices { id name geom } }"
-    ) as stream:
+    # Collect into DataFrame
+    async with await client.stream("{ devices { id name } }") as stream:
         df = await stream.to_pandas()
-        print(df.head())
 
-asyncio.run(main())
-```
-
-### Example: Row-by-row Processing
-
-```python
-import asyncio
-from hugr.stream import connect_stream
-
-async def main():
-    client = connect_stream()
-    async with await client.stream(
-        "query { devices { id name status } }"
-    ) as stream:
+    # Row-by-row processing
+    async with await client.stream("{ devices { id status } }") as stream:
         async for row in stream.rows():
-            if row.get("status") == "active":
-                print("Active device:", row["name"])
+            if row["status"] == "active":
+                print(row["id"])
 
 asyncio.run(main())
 ```
 
-### Example: Query Cancellation
+### Stream methods
+
+| Method | Description |
+|--------|-------------|
+| `stream.chunks()` | Async generator of Arrow RecordBatch |
+| `stream.rows()` | Async generator of dict rows |
+| `stream.to_pandas()` | Collect all batches into DataFrame |
+| `stream.count()` | Count total rows |
+
+### Cancel long queries
 
 ```python
-import asyncio
-from hugr.stream import connect_stream
-
-async def main():
-    client = connect_stream()
-    async with await client.stream(
-        "query { devices { id name } }"
-    ) as stream:
-        count = 0
-        async for batch in stream.chunks():
-            count += batch.num_rows
-            if count > 1000:
-                await client.cancel_current_query()
-                break
-
-asyncio.run(main())
+async with await client.stream("{ large_dataset { ... } }") as stream:
+    count = 0
+    async for batch in stream.chunks():
+        count += batch.num_rows
+        if count > 10000:
+            await client.cancel_current_query()
+            break
 ```
 
-### Notes
+## ETL / Headless Usage
 
-- All streaming functions are asynchronous and require `async`/`await`.
-- Dependencies: `websockets`, `pyarrow`, `pandas`.
-- You can use both a pure streaming client and an enhanced client with HTTP and WebSocket support.
+hugr-client works without Jupyter. No spool files, no display overhead:
 
-See more in [hugr/stream.py](hugr/stream.py) and the code examples in the source files.
+```python
+from hugr import HugrClient
 
-## License
+client = HugrClient()
+result = client.query("{ data_source { id value } }")
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions are welcome!
+# Pure data access — no side effects
+table = result.to_arrow("data.data_source")  # pyarrow.Table
+df = result.df("data.data_source")            # pandas.DataFrame
+```
 
 ## Dependencies
 
-- "requests",
-- "pyarrow",
-- "pandas",
-- "geopandas",
-- "shapely",
-- "requests_toolbelt",
-- "numpy",
-- "shapely",
+**Required:**
+`requests`, `requests-toolbelt`, `pyarrow`, `pandas`, `numpy`, `geopandas`, `shapely`, `websockets`
+
+**Optional (`[viz]`):**
+`keplergl`, `pydeck`, `folium`, `matplotlib`, `mapclassify`
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
