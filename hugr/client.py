@@ -735,8 +735,6 @@ class HugrClient:
             # Priority 3: env vars
             if not url:
                 url = os.environ.get("HUGR_URL")
-                if url and not url.rstrip("/").endswith("/ipc"):
-                    url = url.rstrip("/") + "/ipc"
             if not url:
                 raise ValueError(
                     "No URL provided. Set HUGR_URL env, pass url=, "
