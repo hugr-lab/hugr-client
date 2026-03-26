@@ -61,16 +61,29 @@ def convert_batch(
     columns = []
     fields = []
     for i, field in enumerate(batch.schema):
+        col = batch.column(i)
+        geo_meta = None
+
+        # Detection 1: from geo_fields dict (X-Hugr-Geometry-Fields header)
         if field.name in geo_fields:
             fmt = geo_fields[field.name].get("format", "wkb").lower()
-            if fmt in ("wkb", "geojson", "geojsonstring"):
-                col = batch.column(i)
-                converted, new_field = _convert_geo_column(col, field, geo_fields[field.name])
-                if converted is not None:
-                    columns.append(converted)
-                    fields.append(new_field)
-                    continue
-        columns.append(batch.column(i))
+            if fmt == "wkb":
+                geo_meta = geo_fields[field.name]
+
+        # Detection 2: from Arrow extension metadata on column
+        if geo_meta is None and field.metadata:
+            ext_name = (field.metadata.get(b"ARROW:extension:name") or b"").decode()
+            if ext_name in ("geoarrow.wkb", "ogc.wkb"):
+                geo_meta = {"format": "wkb", "srid": "EPSG:4326"}
+
+        if geo_meta and (pa.types.is_binary(field.type) or pa.types.is_large_binary(field.type)):
+            converted, new_field = _convert_geo_column(col, field, geo_meta)
+            if converted is not None:
+                columns.append(converted)
+                fields.append(new_field)
+                continue
+
+        columns.append(col)
         fields.append(field)
 
     return pa.record_batch(columns, schema=pa.schema(fields))
