@@ -21,17 +21,29 @@ from .arrow_flatten import flatten_batch, needs_flatten
 SPOOL_DIR_NAME = "hugr-client"
 DEFAULT_TTL = 24 * 3600  # 24 hours
 
+# Map Hugr geometry format to Arrow extension name
+_GEO_FORMAT_TO_EXT = {
+    "wkb": "ogc.wkb",
+    "geojson": "ogc.wkb",  # stored as WKB in Arrow
+    "geojsonstring": "ogc.wkb",
+    "h3cell": "",  # H3 cells are strings, no extension
+}
+
 
 def spool_base() -> str:
     """Return spool directory path."""
     return os.path.join(tempfile.gettempdir(), SPOOL_DIR_NAME)
 
 
-def write_spool(batches: list[pa.RecordBatch], schema: pa.Schema) -> str:
+def write_spool(
+    batches: list[pa.RecordBatch],
+    schema: pa.Schema,
+    geom_fields: dict[str, dict[str, str]] | None = None,
+) -> str:
     """Write Arrow batches to spool file. Returns spool ID.
 
     Applies flatten before writing (struct → dot columns, list → JSON string).
-    Geometry columns stored as-is — spool proxy handles replacement at streaming time.
+    Adds Arrow extension metadata for geometry columns so spool proxy can detect them.
     """
     spool_id = uuid.uuid4().hex[:16]
     base = spool_base()
@@ -47,6 +59,11 @@ def write_spool(batches: list[pa.RecordBatch], schema: pa.Schema) -> str:
         else:
             from .arrow_flatten import flatten_schema
             schema = flatten_schema(schema)
+
+    # Add Arrow extension metadata for geometry columns
+    # so spool proxy _is_geo_column() can detect them reliably
+    if geom_fields:
+        schema = _add_geo_metadata(schema, geom_fields)
 
     tmp_path = path + ".tmp"
     try:
@@ -67,6 +84,21 @@ def write_spool(batches: list[pa.RecordBatch], schema: pa.Schema) -> str:
         raise
 
     return spool_id
+
+
+def _add_geo_metadata(schema: pa.Schema, geom_fields: dict) -> pa.Schema:
+    """Add ARROW:extension:name metadata to geometry columns."""
+    fields = []
+    for field in schema:
+        if field.name in geom_fields:
+            fmt = geom_fields[field.name].get("format", "wkb").lower()
+            ext_name = _GEO_FORMAT_TO_EXT.get(fmt, "ogc.wkb")
+            if ext_name:
+                meta = dict(field.metadata or {})
+                meta[b"ARROW:extension:name"] = ext_name.encode()
+                field = field.with_metadata(meta)
+        fields.append(field)
+    return pa.schema(fields)
 
 
 def delete_spool(spool_id: str):

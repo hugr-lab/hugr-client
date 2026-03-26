@@ -76,6 +76,7 @@ class HugrIPCTable:
         return df
 
     def to_geo_dataframe(self, field: str = None) -> gpd.GeoDataFrame:
+        """Convert to GeoDataFrame. Fresh copy each call."""
         if not self.is_geo:
             raise ValueError("Table is not marked as geometry")
         if field is None:
@@ -88,9 +89,11 @@ class HugrIPCTable:
         srid = fi.get("srid")
 
         try:
-            # Copy the DataFrame to avoid modifying the original
-            df = self.df().copy()
-            # Decode only nested geometry fields (in nested objects or arrays of objects)
+            # Convert from raw Arrow (not df() which already decodes geometry)
+            if not self._batches:
+                return gpd.GeoDataFrame()
+            df = pa.Table.from_batches(self._batches).to_pandas()
+            # Flatten nested geometry if needed
             if '.' in field:
                 df = flatten_to_field(df, field)
             df[field] = df[field].apply(lambda x: _decode_geom(x, encoding))
@@ -178,7 +181,10 @@ class HugrIPCTable:
         if self._spool_id is None and self._batches:
             try:
                 from .spool import write_spool
-                self._spool_id = write_spool(self._batches, self._schema)
+                self._spool_id = write_spool(
+                    self._batches, self._schema,
+                    geom_fields=self._geom_fields if self.is_geo else None,
+                )
             except Exception as e:
                 import sys
                 print(f"[hugr-client] Failed to write spool: {e}", file=sys.stderr)
