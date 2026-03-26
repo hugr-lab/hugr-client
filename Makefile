@@ -14,6 +14,7 @@ clean:
 
 lab: install-lab
 	source .venv/bin/activate && \
+		HUGR_SPOOL_EXTRA_DIRS=hugr-client \
 		jupyter lab --no-browser --port=8888
 
 install-lab:

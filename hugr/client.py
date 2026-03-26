@@ -14,6 +14,15 @@ from shapely.geometry.base import BaseGeometry
 
 _table_html_limit = 20
 
+
+def _parse_srid(srid_str: str) -> int:
+    """Parse SRID from 'EPSG:4326', '4326', or empty string."""
+    s = str(srid_str).replace("EPSG:", "").strip()
+    try:
+        return int(s) if s else 4326
+    except ValueError:
+        return 4326
+
 # Lazy detection of spool proxy (JupyterLab with hugr-perspective-viewer)
 _spool_proxy_checked = False
 _spool_proxy_available = False
@@ -158,17 +167,19 @@ class HugrIPCTable:
                         "type": "arrow",
                         "title": self.path or "Result",
                         "spool_id": spool_id,
-                        "arrow_url": f"/arrow/stream?q={spool_id}",
+                        "pin_disabled": True,
+                        "arrow_url": f"/hugr/spool/arrow/stream?q={spool_id}",
                         "rows": sum(b.num_rows for b in self._batches),
                         "columns": [{"name": f.name, "type": str(f.type)} for f in self._schema],
                         "geometry_columns": [
-                            {"name": name, "srid": int(meta.get("srid", "4326").replace("EPSG:", "")), "format": "GeoArrow" if meta.get("format", "wkb").lower() == "wkb" else meta.get("format", "WKB")}
+                            {"name": name, "srid": _parse_srid(meta.get("srid", "4326")), "format": "GeoArrow" if meta.get("format", "wkb").lower() == "wkb" else meta.get("format", "WKB")}
                             for name, meta in self._geom_fields.items()
                         ] if self.is_geo else [],
                     }],
                     "query_id": spool_id,
-                    "arrow_url": f"/arrow/stream?q={spool_id}",
+                    "arrow_url": f"/hugr/spool/arrow/stream?q={spool_id}",
                     "rows": sum(b.num_rows for b in self._batches),
+                    "pin_disabled": True,
                 }
                 return {
                     "application/vnd.hugr.result+json": metadata,
@@ -606,6 +617,69 @@ class HugrIPCResponse:
             </tbody>
         </table>
         """
+
+    def _repr_mimebundle_(self, **kwargs):
+        """Jupyter display: Perspective viewer with all parts, like hugr-kernel."""
+        if not _has_spool_proxy():
+            return {"text/html": self._repr_html_()}
+
+        parts_meta = []
+        first_arrow = None
+
+        for path, part in self.parts.items():
+            if isinstance(part, HugrIPCTable) and part._batches:
+                spool_id = part._ensure_spool()
+                if not spool_id:
+                    continue
+                if first_arrow is None:
+                    first_arrow = (spool_id, part)
+                parts_meta.append({
+                    "id": spool_id,
+                    "type": "arrow",
+                    "title": path,
+                    "spool_id": spool_id,
+                    "pin_disabled": True,
+                    "arrow_url": f"/hugr/spool/arrow/stream?q={spool_id}",
+                    "rows": sum(b.num_rows for b in part._batches),
+                    "columns": [{"name": f.name, "type": str(f.type)} for f in part._schema],
+                    "geometry_columns": [
+                        {"name": name, "srid": _parse_srid(meta.get("srid", "4326")),
+                         "format": "GeoArrow" if meta.get("format", "wkb").lower() == "wkb" else meta.get("format", "WKB")}
+                        for name, meta in part._geom_fields.items()
+                    ] if part.is_geo else [],
+                })
+            elif isinstance(part, HugrIPCObject):
+                parts_meta.append({
+                    "id": path,
+                    "type": "json",
+                    "title": path,
+                    "data": part.dict(),
+                })
+
+        # Extensions (metadata from query response)
+        for path, ext in self.extensions().items():
+            parts_meta.append({
+                "id": path,
+                "type": "json",
+                "title": path,
+                "data": ext.dict(),
+            })
+
+        if not parts_meta:
+            return {"text/html": self._repr_html_()}
+
+        metadata = {"parts": parts_meta}
+        # Backward-compatible flat fields from first Arrow part
+        if first_arrow:
+            sid, p = first_arrow
+            metadata["query_id"] = sid
+            metadata["arrow_url"] = f"/hugr/spool/arrow/stream?q={sid}"
+            metadata["rows"] = sum(b.num_rows for b in p._batches)
+
+        return {
+            "application/vnd.hugr.result+json": metadata,
+            "text/html": self._repr_html_(),
+        }
 
     def geojson_layers(self):
         features = {}
