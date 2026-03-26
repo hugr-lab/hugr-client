@@ -142,14 +142,13 @@ class HugrStreamingClient:
         else:
             raise ValueError("URL is required")
 
-        self._headers = (headers.copy() if headers else {}).update(
-            {
-                'Upgrade': 'websocket',
-                'Connection': 'Upgrade',
-                'Sec-WebSocket-Version': '13',
-                'Sec-WebSocket-Key': 'hugr-streaming-client',
-            }
-        )
+        self._headers = headers.copy() if headers else {}
+        self._headers.update({
+            'Upgrade': 'websocket',
+            'Connection': 'Upgrade',
+            'Sec-WebSocket-Version': '13',
+            'Sec-WebSocket-Key': 'hugr-streaming-client',
+        })
 
         self.websocket = None
         self._connected = False
