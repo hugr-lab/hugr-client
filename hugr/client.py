@@ -14,12 +14,29 @@ from shapely.geometry.base import BaseGeometry
 
 _table_html_limit = 20
 
+# Lazy detection of spool proxy (JupyterLab with hugr-perspective-viewer)
+_spool_proxy_checked = False
+_spool_proxy_available = False
+
+
+def _has_spool_proxy() -> bool:
+    """Check if we're running inside Jupyter with spool proxy available."""
+    global _spool_proxy_checked, _spool_proxy_available
+    if _spool_proxy_checked:
+        return _spool_proxy_available
+    _spool_proxy_checked = True
+    try:
+        from jupyter_server import serverapp  # noqa: F401
+        _spool_proxy_available = True
+    except ImportError:
+        _spool_proxy_available = False
+    return _spool_proxy_available
+
 
 class HugrIPCTable:
     path: str
     _geom_fields: Dict[str, Dict[str, str]]
     is_geo: bool
-    _df: pd.DataFrame
 
     def __init__(
         self,
@@ -31,26 +48,32 @@ class HugrIPCTable:
         self.path = path
         self._geom_fields = geom_fields
         self.is_geo = is_geo
-        if len(batches) != 0:
-            self._df = pa.Table.from_batches(batches).to_pandas()
-        else:
-            self._df = pd.DataFrame()
-        # Decode first level geometry fields
-        if is_geo:
-            for field, fi in geom_fields.items():
+        self._batches = batches
+        self._schema = batches[0].schema if batches else pa.schema([])
+        self._spool_id = None
+
+    def to_arrow(self) -> pa.Table:
+        """Return pyarrow Table. Zero-copy from original batches."""
+        if not self._batches:
+            return pa.table({})
+        return pa.Table.from_batches(self._batches)
+
+    def df(self) -> pd.DataFrame:
+        """Convert to pandas DataFrame. Fresh copy each call."""
+        if not self._batches:
+            return pd.DataFrame()
+        df = pa.Table.from_batches(self._batches).to_pandas()
+        # Decode first-level geometry fields
+        if self.is_geo:
+            for field, fi in self._geom_fields.items():
                 encoding = fi.get("format", "wkb").lower()
                 if len(field.split(".")) == 1:
                     if encoding == "h3cell":
-                        # H3 cells are stored as strings, no decoding needed
                         continue
-                    self._df[field] = self._df[field].apply(
+                    df[field] = df[field].apply(
                         lambda x: _decode_geom(x, encoding)
                     )
-
-    def df(self) -> pd.DataFrame:
-        if self._df is None:
-            raise ValueError("DataFrame not loaded")
-        return self._df
+        return df
 
     def to_geo_dataframe(self, field: str = None) -> gpd.GeoDataFrame:
         if not self.is_geo:
@@ -79,8 +102,8 @@ class HugrIPCTable:
             print(f"[warn] Failed to decode geometry field {field}: {e}")
 
     def info(self) -> str:
-        fields = self._df.columns.tolist()
-        num_rows = len(self._df)
+        fields = [f.name for f in self._schema]
+        num_rows = sum(b.num_rows for b in self._batches)
         num_cols = len(fields)
 
         return (
@@ -93,7 +116,7 @@ class HugrIPCTable:
         )
 
     def _repr_html_(self):
-        preview_html = self._df.head(20).to_html(
+        preview_html = self.df().head(20).to_html(
             border=1, index=False
         )  # максимум 20 строк в предпросмотр
 
@@ -120,6 +143,56 @@ class HugrIPCTable:
             </div>
         </div>
         """
+
+    def _repr_mimebundle_(self, **kwargs):
+        """Jupyter display: Perspective viewer if spool proxy available, else HTML."""
+        if _has_spool_proxy():
+            spool_id = self._ensure_spool()
+            if spool_id:
+                metadata = {
+                    "parts": [{
+                        "id": spool_id,
+                        "type": "arrow",
+                        "title": self.path or "Result",
+                        "spool_id": spool_id,
+                        "arrow_url": f"/arrow/stream?q={spool_id}",
+                        "rows": sum(b.num_rows for b in self._batches),
+                        "columns": [{"name": f.name, "type": str(f.type)} for f in self._schema],
+                        "geometry_columns": [
+                            {"name": name, "srid": int(meta.get("srid", "4326").replace("EPSG:", "")), "format": meta.get("format", "WKB")}
+                            for name, meta in self._geom_fields.items()
+                        ] if self.is_geo else [],
+                    }],
+                    "query_id": spool_id,
+                    "arrow_url": f"/arrow/stream?q={spool_id}",
+                    "rows": sum(b.num_rows for b in self._batches),
+                }
+                return {
+                    "application/vnd.hugr.result+json": metadata,
+                    "text/html": self._repr_html_(),
+                }
+        return {"text/html": self._repr_html_()}
+
+    def _ensure_spool(self) -> str | None:
+        """Write spool file if not yet written."""
+        if self._spool_id is None and self._batches:
+            try:
+                from .spool import write_spool
+                self._spool_id = write_spool(self._batches, self._schema)
+            except Exception as e:
+                import sys
+                print(f"[hugr-client] Failed to write spool: {e}", file=sys.stderr)
+                return None
+        return self._spool_id
+
+    def __del__(self):
+        """Cleanup spool file on garbage collection."""
+        if getattr(self, '_spool_id', None):
+            try:
+                from .spool import delete_spool
+                delete_spool(self._spool_id)
+            except Exception:
+                pass
 
     def geojson_layers(self):
         data = {}
