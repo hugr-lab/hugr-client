@@ -11,21 +11,17 @@ requires-python = ">=3.8"
 
 dependencies = [
     "requests",
-    "pyarrow",
+    "requests-toolbelt",
+    "pyarrow>=14.0",
     "pandas",
+    "numpy",
     "geopandas",
     "shapely",
-    "requests_toolbelt",
-    "numpy",
-    "shapely",
-    "keplergl",
-    "pydeck",
-    "folium",
-    "matplotlib",
-    "mapclassify",
     "websockets",
-    "asyncio",
 ]
+
+[project.optional-dependencies]
+viz = ["keplergl", "pydeck", "folium", "matplotlib", "mapclassify"]
 
 [project.urls]
 Homepage = "https://github.com/hugr-lab/hugr-client"

@@ -108,10 +108,26 @@ class HugrStreamingClient:
         self,
         url: str = None,
         headers: Dict[str, str] = None,
+        api_key: str = None,
+        api_key_header: str = None,
+        token: str = None,
+        role: str = None,
         max_frame_size: int = 128 * 1024 * 1024,
     ):
         if not url:
             url = os.environ.get("HUGR_URL")
+
+        # Build auth headers if provided
+        if headers is None:
+            headers = {}
+        if api_key:
+            header_name = api_key_header or os.environ.get("HUGR_API_KEY_HEADER", "X-Hugr-Api-Key")
+            headers[header_name] = api_key
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        if role:
+            role_header = os.environ.get("HUGR_ROLE_HEADER", "X-Hugr-Role")
+            headers[role_header] = role
 
         self.base_url = url.rstrip('/') if url else None
 
@@ -126,14 +142,13 @@ class HugrStreamingClient:
         else:
             raise ValueError("URL is required")
 
-        self._headers = (headers.copy() if headers else {}).update(
-            {
-                'Upgrade': 'websocket',
-                'Connection': 'Upgrade',
-                'Sec-WebSocket-Version': '13',
-                'Sec-WebSocket-Key': 'hugr-streaming-client',
-            }
-        )
+        self._headers = headers.copy() if headers else {}
+        self._headers.update({
+            'Upgrade': 'websocket',
+            'Connection': 'Upgrade',
+            'Sec-WebSocket-Version': '13',
+            'Sec-WebSocket-Key': 'hugr-streaming-client',
+        })
 
         self.websocket = None
         self._connected = False
@@ -337,12 +352,13 @@ class HugrStreamConnection(HugrClient):
 def connect_stream(
     url: str = None,
     api_key: str = None,
+    api_key_header: str = None,
     token: str = None,
     role: str = None,
     max_frame_size: int = 128 * 1024 * 1024,
 ) -> HugrStreamConnection:
     return HugrStreamConnection(
-        url, api_key, token, role, max_frame_size=max_frame_size
+        url, api_key, api_key_header, token, role, max_frame_size=max_frame_size
     )
 
 
@@ -350,7 +366,7 @@ def new_stream_connection(client: HugrClient) -> HugrStreamConnection:
     """Get streaming client from existing HugrClient"""
     if not isinstance(client, HugrStreamConnection):
         client = HugrStreamConnection(
-            client._url, client._api_key, client._token, client._role
+            client._url, client._api_key, client._api_key_header, client._token, client._role
         )
     return client
 

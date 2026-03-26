@@ -12,11 +12,14 @@ clean:
 	rm -rf *.pyd
 	rm -rf *.egg-info
 
-lab:
+lab: install-lab
+	source .venv/bin/activate && \
+		HUGR_SPOOL_EXTRA_DIRS=hugr-client \
+		jupyter lab --no-browser --port=8888
+
+install-lab:
 	source .venv/bin/activate && \
 		uv pip install jupyterlab ipykernel && \
-		uv pip install jupyterlab-lsp python-lsp-server[all] && \
-		uv pip install python-lsp-server[rope] pylsp-mypy pylsp-rope && \
 		uv pip install -e . && \
-		python -m ipykernel install --user --name=venv --display-name="Python (hugr)" && \
-		jupyter lab --no-browser --port=8888
+		uv pip install "hugr-perspective-viewer>=0.3.2" && \
+		python -m ipykernel install --user --name=venv --display-name="Python (hugr)"

@@ -15,11 +15,37 @@ from shapely.geometry.base import BaseGeometry
 _table_html_limit = 20
 
 
+def _parse_srid(srid_str: str) -> int:
+    """Parse SRID from 'EPSG:4326', '4326', or empty string."""
+    s = str(srid_str).replace("EPSG:", "").strip()
+    try:
+        return int(s) if s else 4326
+    except ValueError:
+        return 4326
+
+# Lazy detection of spool proxy (JupyterLab with hugr-perspective-viewer)
+_spool_proxy_checked = False
+_spool_proxy_available = False
+
+
+def _has_spool_proxy() -> bool:
+    """Check if we're running inside Jupyter with spool proxy available."""
+    global _spool_proxy_checked, _spool_proxy_available
+    if _spool_proxy_checked:
+        return _spool_proxy_available
+    _spool_proxy_checked = True
+    try:
+        from jupyter_server import serverapp  # noqa: F401
+        _spool_proxy_available = True
+    except ImportError:
+        _spool_proxy_available = False
+    return _spool_proxy_available
+
+
 class HugrIPCTable:
     path: str
     _geom_fields: Dict[str, Dict[str, str]]
     is_geo: bool
-    _df: pd.DataFrame
 
     def __init__(
         self,
@@ -31,28 +57,35 @@ class HugrIPCTable:
         self.path = path
         self._geom_fields = geom_fields
         self.is_geo = is_geo
-        if len(batches) != 0:
-            self._df = pa.Table.from_batches(batches).to_pandas()
-        else:
-            self._df = pd.DataFrame()
-        # Decode first level geometry fields
-        if is_geo:
-            for field, fi in geom_fields.items():
+        self._batches = batches
+        self._schema = batches[0].schema if batches else pa.schema([])
+        self._spool_id = None
+
+    def to_arrow(self) -> pa.Table:
+        """Return pyarrow Table. Zero-copy from original batches."""
+        if not self._batches:
+            return pa.table({})
+        return pa.Table.from_batches(self._batches)
+
+    def df(self) -> pd.DataFrame:
+        """Convert to pandas DataFrame. Fresh copy each call."""
+        if not self._batches:
+            return pd.DataFrame()
+        df = pa.Table.from_batches(self._batches).to_pandas()
+        # Decode first-level geometry fields
+        if self.is_geo:
+            for field, fi in self._geom_fields.items():
                 encoding = fi.get("format", "wkb").lower()
                 if len(field.split(".")) == 1:
                     if encoding == "h3cell":
-                        # H3 cells are stored as strings, no decoding needed
                         continue
-                    self._df[field] = self._df[field].apply(
+                    df[field] = df[field].apply(
                         lambda x: _decode_geom(x, encoding)
                     )
-
-    def df(self) -> pd.DataFrame:
-        if self._df is None:
-            raise ValueError("DataFrame not loaded")
-        return self._df
+        return df
 
     def to_geo_dataframe(self, field: str = None) -> gpd.GeoDataFrame:
+        """Convert to GeoDataFrame. Fresh copy each call."""
         if not self.is_geo:
             raise ValueError("Table is not marked as geometry")
         if field is None:
@@ -65,9 +98,11 @@ class HugrIPCTable:
         srid = fi.get("srid")
 
         try:
-            # Copy the DataFrame to avoid modifying the original
-            df = self.df().copy()
-            # Decode only nested geometry fields (in nested objects or arrays of objects)
+            # Convert from raw Arrow (not df() which already decodes geometry)
+            if not self._batches:
+                return gpd.GeoDataFrame()
+            df = pa.Table.from_batches(self._batches).to_pandas()
+            # Flatten nested geometry if needed
             if '.' in field:
                 df = flatten_to_field(df, field)
             df[field] = df[field].apply(lambda x: _decode_geom(x, encoding))
@@ -79,8 +114,8 @@ class HugrIPCTable:
             print(f"[warn] Failed to decode geometry field {field}: {e}")
 
     def info(self) -> str:
-        fields = self._df.columns.tolist()
-        num_rows = len(self._df)
+        fields = [f.name for f in self._schema]
+        num_rows = sum(b.num_rows for b in self._batches)
         num_cols = len(fields)
 
         return (
@@ -93,7 +128,7 @@ class HugrIPCTable:
         )
 
     def _repr_html_(self):
-        preview_html = self._df.head(20).to_html(
+        preview_html = self.df().head(20).to_html(
             border=1, index=False
         )  # максимум 20 строк в предпросмотр
 
@@ -120,6 +155,61 @@ class HugrIPCTable:
             </div>
         </div>
         """
+
+    def _repr_mimebundle_(self, **kwargs):
+        """Jupyter display: Perspective viewer if spool proxy available, else HTML."""
+        if _has_spool_proxy():
+            spool_id = self._ensure_spool()
+            if spool_id:
+                metadata = {
+                    "parts": [{
+                        "id": spool_id,
+                        "type": "arrow",
+                        "title": self.path or "Result",
+                        "spool_id": spool_id,
+                        "pin_disabled": True,
+                        "arrow_url": f"/hugr/spool/arrow/stream?q={spool_id}",
+                        "rows": sum(b.num_rows for b in self._batches),
+                        "columns": [{"name": f.name, "type": str(f.type)} for f in self._schema],
+                        "geometry_columns": [
+                            {"name": name, "srid": _parse_srid(meta.get("srid", "4326")), "format": "GeoArrow" if meta.get("format", "wkb").lower() == "wkb" else meta.get("format", "WKB")}
+                            for name, meta in self._geom_fields.items()
+                        ] if self.is_geo else [],
+                    }],
+                    "query_id": spool_id,
+                    "arrow_url": f"/hugr/spool/arrow/stream?q={spool_id}",
+                    "rows": sum(b.num_rows for b in self._batches),
+                    "pin_disabled": True,
+                }
+                return {
+                    "application/vnd.hugr.result+json": metadata,
+                    "text/html": self._repr_html_(),
+                }
+        return {"text/html": self._repr_html_()}
+
+    def _ensure_spool(self) -> str | None:
+        """Write spool file if not yet written."""
+        if self._spool_id is None and self._batches:
+            try:
+                from .spool import write_spool
+                self._spool_id = write_spool(
+                    self._batches, self._schema,
+                    geom_fields=self._geom_fields if self.is_geo else None,
+                )
+            except Exception as e:
+                import sys
+                print(f"[hugr-client] Failed to write spool: {e}", file=sys.stderr)
+                return None
+        return self._spool_id
+
+    def __del__(self):
+        """Cleanup spool file on garbage collection."""
+        if getattr(self, '_spool_id', None):
+            try:
+                from .spool import delete_spool
+                delete_spool(self._spool_id)
+            except Exception:
+                pass
 
     def geojson_layers(self):
         data = {}
@@ -528,6 +618,69 @@ class HugrIPCResponse:
         </table>
         """
 
+    def _repr_mimebundle_(self, **kwargs):
+        """Jupyter display: Perspective viewer with all parts, like hugr-kernel."""
+        if not _has_spool_proxy():
+            return {"text/html": self._repr_html_()}
+
+        parts_meta = []
+        first_arrow = None
+
+        for path, part in self.parts.items():
+            if isinstance(part, HugrIPCTable) and part._batches:
+                spool_id = part._ensure_spool()
+                if not spool_id:
+                    continue
+                if first_arrow is None:
+                    first_arrow = (spool_id, part)
+                parts_meta.append({
+                    "id": spool_id,
+                    "type": "arrow",
+                    "title": path,
+                    "spool_id": spool_id,
+                    "pin_disabled": True,
+                    "arrow_url": f"/hugr/spool/arrow/stream?q={spool_id}",
+                    "rows": sum(b.num_rows for b in part._batches),
+                    "columns": [{"name": f.name, "type": str(f.type)} for f in part._schema],
+                    "geometry_columns": [
+                        {"name": name, "srid": _parse_srid(meta.get("srid", "4326")),
+                         "format": "GeoArrow" if meta.get("format", "wkb").lower() == "wkb" else meta.get("format", "WKB")}
+                        for name, meta in part._geom_fields.items()
+                    ] if part.is_geo else [],
+                })
+            elif isinstance(part, HugrIPCObject):
+                parts_meta.append({
+                    "id": path,
+                    "type": "json",
+                    "title": path,
+                    "data": part.dict(),
+                })
+
+        # Extensions (metadata from query response)
+        for path, ext in self.extensions().items():
+            parts_meta.append({
+                "id": path,
+                "type": "json",
+                "title": path,
+                "data": ext.dict(),
+            })
+
+        if not parts_meta:
+            return {"text/html": self._repr_html_()}
+
+        metadata = {"parts": parts_meta}
+        # Backward-compatible flat fields from first Arrow part
+        if first_arrow:
+            sid, p = first_arrow
+            metadata["query_id"] = sid
+            metadata["arrow_url"] = f"/hugr/spool/arrow/stream?q={sid}"
+            metadata["rows"] = sum(b.num_rows for b in p._batches)
+
+        return {
+            "application/vnd.hugr.result+json": metadata,
+            "text/html": self._repr_html_(),
+        }
+
     def geojson_layers(self):
         features = {}
         for path, part in self.parts.items():
@@ -557,22 +710,90 @@ class HugrClient:
         self,
         url: str = None,
         api_key: str = None,
+        api_key_header: str = None,
         token: str = None,
         role: str = None,
+        connection: str = None,
     ):
-        if not url:
-            url = os.environ.get("HUGR_URL")
+        self._connection_name = None
+
+        # Priority 1: named connection from connections.json
+        if connection is not None:
+            self._apply_connection(connection if isinstance(connection, str) else None,
+                                   connection if isinstance(connection, dict) else None,
+                                   url, api_key, api_key_header, token, role)
+        else:
+            # Priority 2: explicit args + env vars
             if not url:
-                raise ValueError("HUGR_URL environment variable not set")
-        if not api_key and not token:
-            api_key = os.environ.get("HUGR_API_KEY")
-            token = os.environ.get("HUGR_TOKEN")
-        self._url = url
-        self._api_key = api_key
-        self._token = token
-        self._role = role
-        self._api_key_header = os.environ.get("HUGR_API_KEY_HEADER", "X-Hugr-Api-Key")
+                url = os.environ.get("HUGR_URL")
+            if not url:
+                # Priority 3: default connection from connections.json
+                try:
+                    from .connections import get_connection
+                    conn = get_connection()
+                    self._apply_connection(None, conn, url, api_key, api_key_header, token, role)
+                    return
+                except (ValueError, FileNotFoundError):
+                    raise ValueError(
+                        "No URL provided. Set HUGR_URL env, pass url=, "
+                        "or configure a connection in ~/.hugr/connections.json"
+                    )
+            if not api_key and not token:
+                api_key = os.environ.get("HUGR_API_KEY")
+                token = os.environ.get("HUGR_TOKEN")
+            self._url = url
+            self._api_key = api_key
+            self._token = token
+            self._role = role
+            self._api_key_header = (
+                api_key_header
+                or os.environ.get("HUGR_API_KEY_HEADER", "X-Hugr-Api-Key")
+            )
+            self._role_header = os.environ.get("HUGR_ROLE_HEADER", "X-Hugr-Role")
+
+    def _apply_connection(self, name, conn_dict, url, api_key, api_key_header, token, role):
+        """Apply connection config from connections.json, with explicit args taking priority."""
+        if conn_dict is None:
+            from .connections import get_connection
+            conn_dict = get_connection(name)
+
+        self._connection_name = conn_dict.get("name")
+        self._url = url or conn_dict.get("url")
+        self._role = role or conn_dict.get("role")
         self._role_header = os.environ.get("HUGR_ROLE_HEADER", "X-Hugr-Role")
+
+        auth_type = conn_dict.get("auth_type", "public")
+        if auth_type == "api_key" and not api_key:
+            self._api_key = conn_dict.get("api_key")
+            self._api_key_header = (
+                api_key_header
+                or conn_dict.get("api_key_header")
+                or os.environ.get("HUGR_API_KEY_HEADER", "X-Hugr-Api-Key")
+            )
+        else:
+            self._api_key = api_key
+            self._api_key_header = (
+                api_key_header
+                or os.environ.get("HUGR_API_KEY_HEADER", "X-Hugr-Api-Key")
+            )
+
+        if auth_type in ("bearer", "hub", "browser") and not token:
+            self._token = (
+                (conn_dict.get("tokens") or {}).get("access_token")
+                or conn_dict.get("token")
+            )
+        else:
+            self._token = token
+
+        if not self._url:
+            raise ValueError(f"Connection '{self._connection_name}' has no URL")
+
+    @classmethod
+    def from_connection(cls, name: str = None, **kwargs):
+        """Create client from a named connection in ~/.hugr/connections.json."""
+        from .connections import get_connection
+        conn = get_connection(name)
+        return cls(connection=conn, **kwargs)
 
     def _headers(self):
         headers = {"Accept": "multipart/mixed", "Content-Type": "application/json"}
@@ -588,6 +809,29 @@ class HugrClient:
         headers = self._headers()
         payload = {"query": query, "variables": variables or {}}
         resp = requests.post(self._url, headers=headers, json=payload)
+
+        # Token may have been refreshed by connection service — re-read and retry
+        if resp.status_code == 401 and self._connection_name:
+            try:
+                from .connections import get_connection
+                conn = get_connection(self._connection_name)
+                new_token = (conn.get("tokens") or {}).get("access_token")
+                if new_token and new_token != self._token:
+                    self._token = new_token
+                    headers = self._headers()
+                    resp = requests.post(self._url, headers=headers, json=payload)
+            except (ValueError, FileNotFoundError):
+                pass
+
+        if resp.status_code == 401:
+            raise PermissionError(
+                "Authentication failed (401). Token expired or invalid. "
+                "Re-login via connection manager or check credentials."
+            )
+        if resp.status_code == 403:
+            raise PermissionError(
+                "Access denied (403). Insufficient permissions."
+            )
         if resp.status_code == 500:
             raise ValueError(f"Server error: {resp.status_code} {resp.text}")
         resp.raise_for_status()
@@ -602,28 +846,35 @@ def query(
     variables: dict = None,
     url: str = None,
     api_key: str = None,
+    api_key_header: str = None,
     token: str = None,
     role: str = None,
 ):
-    client = HugrClient(url=url, api_key=api_key, token=token, role=role)
+    client = HugrClient(url=url, api_key=api_key, api_key_header=api_key_header, token=token, role=role)
     return client.query(query, variables)
 
 
 def connect(
     url: str = None,
     api_key: str = None,
+    api_key_header: str = None,
     token: str = None,
     role: str = None,
 ):
-    return HugrClient(url, api_key, token, role)
+    return HugrClient(url, api_key, api_key_header, token, role)
 
 
 def explore_map(
     object: Union[HugrIPCResponse, HugrIPCTable, HugrIPCObject], width=800, height=600
 ):
+    try:
+        from keplergl import KeplerGl
+    except ImportError:
+        raise ImportError(
+            "keplergl is required for explore_map(). "
+            "Install with: pip install hugr-client[viz]"
+        )
     data = object.df_with_geojson()
-    from keplergl import KeplerGl
-
     m = KeplerGl(width=width, height=height)
     for path, layer in data.items():
         m.add_data(data=layer, name=path)
