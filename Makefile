@@ -21,5 +21,5 @@ install-lab:
 	source .venv/bin/activate && \
 		uv pip install jupyterlab ipykernel && \
 		uv pip install -e . && \
-		uv pip install hugr-perspective-viewer && \
+		uv pip install "hugr-perspective-viewer>=0.3.2" && \
 		python -m ipykernel install --user --name=venv --display-name="Python (hugr)"
