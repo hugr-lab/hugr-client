@@ -557,22 +557,90 @@ class HugrClient:
         self,
         url: str = None,
         api_key: str = None,
+        api_key_header: str = None,
         token: str = None,
         role: str = None,
+        connection: str = None,
     ):
-        if not url:
-            url = os.environ.get("HUGR_URL")
+        self._connection_name = None
+
+        # Priority 1: named connection from connections.json
+        if connection is not None:
+            self._apply_connection(connection if isinstance(connection, str) else None,
+                                   connection if isinstance(connection, dict) else None,
+                                   url, api_key, api_key_header, token, role)
+        else:
+            # Priority 2: explicit args + env vars
             if not url:
-                raise ValueError("HUGR_URL environment variable not set")
-        if not api_key and not token:
-            api_key = os.environ.get("HUGR_API_KEY")
-            token = os.environ.get("HUGR_TOKEN")
-        self._url = url
-        self._api_key = api_key
-        self._token = token
-        self._role = role
-        self._api_key_header = os.environ.get("HUGR_API_KEY_HEADER", "X-Hugr-Api-Key")
+                url = os.environ.get("HUGR_URL")
+            if not url:
+                # Priority 3: default connection from connections.json
+                try:
+                    from .connections import get_connection
+                    conn = get_connection()
+                    self._apply_connection(None, conn, url, api_key, api_key_header, token, role)
+                    return
+                except (ValueError, FileNotFoundError):
+                    raise ValueError(
+                        "No URL provided. Set HUGR_URL env, pass url=, "
+                        "or configure a connection in ~/.hugr/connections.json"
+                    )
+            if not api_key and not token:
+                api_key = os.environ.get("HUGR_API_KEY")
+                token = os.environ.get("HUGR_TOKEN")
+            self._url = url
+            self._api_key = api_key
+            self._token = token
+            self._role = role
+            self._api_key_header = (
+                api_key_header
+                or os.environ.get("HUGR_API_KEY_HEADER", "X-Hugr-Api-Key")
+            )
+            self._role_header = os.environ.get("HUGR_ROLE_HEADER", "X-Hugr-Role")
+
+    def _apply_connection(self, name, conn_dict, url, api_key, api_key_header, token, role):
+        """Apply connection config from connections.json, with explicit args taking priority."""
+        if conn_dict is None:
+            from .connections import get_connection
+            conn_dict = get_connection(name)
+
+        self._connection_name = conn_dict.get("name")
+        self._url = url or conn_dict.get("url")
+        self._role = role or conn_dict.get("role")
         self._role_header = os.environ.get("HUGR_ROLE_HEADER", "X-Hugr-Role")
+
+        auth_type = conn_dict.get("auth_type", "public")
+        if auth_type == "api_key" and not api_key:
+            self._api_key = conn_dict.get("api_key")
+            self._api_key_header = (
+                api_key_header
+                or conn_dict.get("api_key_header")
+                or os.environ.get("HUGR_API_KEY_HEADER", "X-Hugr-Api-Key")
+            )
+        else:
+            self._api_key = api_key
+            self._api_key_header = (
+                api_key_header
+                or os.environ.get("HUGR_API_KEY_HEADER", "X-Hugr-Api-Key")
+            )
+
+        if auth_type in ("bearer", "hub", "browser") and not token:
+            self._token = (
+                (conn_dict.get("tokens") or {}).get("access_token")
+                or conn_dict.get("token")
+            )
+        else:
+            self._token = token
+
+        if not self._url:
+            raise ValueError(f"Connection '{self._connection_name}' has no URL")
+
+    @classmethod
+    def from_connection(cls, name: str = None, **kwargs):
+        """Create client from a named connection in ~/.hugr/connections.json."""
+        from .connections import get_connection
+        conn = get_connection(name)
+        return cls(connection=conn, **kwargs)
 
     def _headers(self):
         headers = {"Accept": "multipart/mixed", "Content-Type": "application/json"}
@@ -588,6 +656,29 @@ class HugrClient:
         headers = self._headers()
         payload = {"query": query, "variables": variables or {}}
         resp = requests.post(self._url, headers=headers, json=payload)
+
+        # Token may have been refreshed by connection service — re-read and retry
+        if resp.status_code == 401 and self._connection_name:
+            try:
+                from .connections import get_connection
+                conn = get_connection(self._connection_name)
+                new_token = (conn.get("tokens") or {}).get("access_token")
+                if new_token and new_token != self._token:
+                    self._token = new_token
+                    headers = self._headers()
+                    resp = requests.post(self._url, headers=headers, json=payload)
+            except (ValueError, FileNotFoundError):
+                pass
+
+        if resp.status_code == 401:
+            raise PermissionError(
+                "Authentication failed (401). Token expired or invalid. "
+                "Re-login via connection manager or check credentials."
+            )
+        if resp.status_code == 403:
+            raise PermissionError(
+                "Access denied (403). Insufficient permissions."
+            )
         if resp.status_code == 500:
             raise ValueError(f"Server error: {resp.status_code} {resp.text}")
         resp.raise_for_status()
@@ -602,28 +693,35 @@ def query(
     variables: dict = None,
     url: str = None,
     api_key: str = None,
+    api_key_header: str = None,
     token: str = None,
     role: str = None,
 ):
-    client = HugrClient(url=url, api_key=api_key, token=token, role=role)
+    client = HugrClient(url=url, api_key=api_key, api_key_header=api_key_header, token=token, role=role)
     return client.query(query, variables)
 
 
 def connect(
     url: str = None,
     api_key: str = None,
+    api_key_header: str = None,
     token: str = None,
     role: str = None,
 ):
-    return HugrClient(url, api_key, token, role)
+    return HugrClient(url, api_key, api_key_header, token, role)
 
 
 def explore_map(
     object: Union[HugrIPCResponse, HugrIPCTable, HugrIPCObject], width=800, height=600
 ):
+    try:
+        from keplergl import KeplerGl
+    except ImportError:
+        raise ImportError(
+            "keplergl is required for explore_map(). "
+            "Install with: pip install hugr-client[viz]"
+        )
     data = object.df_with_geojson()
-    from keplergl import KeplerGl
-
     m = KeplerGl(width=width, height=height)
     for path, layer in data.items():
         m.add_data(data=layer, name=path)

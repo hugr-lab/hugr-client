@@ -337,12 +337,13 @@ class HugrStreamConnection(HugrClient):
 def connect_stream(
     url: str = None,
     api_key: str = None,
+    api_key_header: str = None,
     token: str = None,
     role: str = None,
     max_frame_size: int = 128 * 1024 * 1024,
 ) -> HugrStreamConnection:
     return HugrStreamConnection(
-        url, api_key, token, role, max_frame_size=max_frame_size
+        url, api_key, api_key_header, token, role, max_frame_size=max_frame_size
     )
 
 
@@ -350,7 +351,7 @@ def new_stream_connection(client: HugrClient) -> HugrStreamConnection:
     """Get streaming client from existing HugrClient"""
     if not isinstance(client, HugrStreamConnection):
         client = HugrStreamConnection(
-            client._url, client._api_key, client._token, client._role
+            client._url, client._api_key, client._api_key_header, client._token, client._role
         )
     return client
 
