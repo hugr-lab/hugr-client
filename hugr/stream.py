@@ -108,10 +108,26 @@ class HugrStreamingClient:
         self,
         url: str = None,
         headers: Dict[str, str] = None,
+        api_key: str = None,
+        api_key_header: str = None,
+        token: str = None,
+        role: str = None,
         max_frame_size: int = 128 * 1024 * 1024,
     ):
         if not url:
             url = os.environ.get("HUGR_URL")
+
+        # Build auth headers if provided
+        if headers is None:
+            headers = {}
+        if api_key:
+            header_name = api_key_header or os.environ.get("HUGR_API_KEY_HEADER", "X-Hugr-Api-Key")
+            headers[header_name] = api_key
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        if role:
+            role_header = os.environ.get("HUGR_ROLE_HEADER", "X-Hugr-Role")
+            headers[role_header] = role
 
         self.base_url = url.rstrip('/') if url else None
 
