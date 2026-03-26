@@ -723,21 +723,25 @@ class HugrClient:
                                    connection if isinstance(connection, dict) else None,
                                    url, api_key, api_key_header, token, role)
         else:
-            # Priority 2: explicit args + env vars
+            # Priority 2: default connection from connections.json
             if not url:
-                url = os.environ.get("HUGR_URL")
-            if not url:
-                # Priority 3: default connection from connections.json
                 try:
                     from .connections import get_connection
                     conn = get_connection()
                     self._apply_connection(None, conn, url, api_key, api_key_header, token, role)
                     return
                 except (ValueError, FileNotFoundError):
-                    raise ValueError(
-                        "No URL provided. Set HUGR_URL env, pass url=, "
-                        "or configure a connection in ~/.hugr/connections.json"
-                    )
+                    pass
+            # Priority 3: env vars
+            if not url:
+                url = os.environ.get("HUGR_URL")
+                if url and not url.rstrip("/").endswith("/ipc"):
+                    url = url.rstrip("/") + "/ipc"
+            if not url:
+                raise ValueError(
+                    "No URL provided. Set HUGR_URL env, pass url=, "
+                    "or configure a connection in ~/.hugr/connections.json"
+                )
             if not api_key and not token:
                 api_key = os.environ.get("HUGR_API_KEY")
                 token = os.environ.get("HUGR_TOKEN")
