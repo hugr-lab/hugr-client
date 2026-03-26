@@ -162,7 +162,7 @@ class HugrIPCTable:
                         "rows": sum(b.num_rows for b in self._batches),
                         "columns": [{"name": f.name, "type": str(f.type)} for f in self._schema],
                         "geometry_columns": [
-                            {"name": name, "srid": int(meta.get("srid", "4326").replace("EPSG:", "")), "format": meta.get("format", "WKB")}
+                            {"name": name, "srid": int(meta.get("srid", "4326").replace("EPSG:", "")), "format": "GeoArrow" if meta.get("format", "wkb").lower() == "wkb" else meta.get("format", "WKB")}
                             for name, meta in self._geom_fields.items()
                         ] if self.is_geo else [],
                     }],
