@@ -60,10 +60,12 @@ def write_spool(
             from .arrow_flatten import flatten_schema
             schema = flatten_schema(schema)
 
-    # Add Arrow extension metadata for geometry columns
-    # so spool proxy _is_geo_column() can detect them reliably
+    # Convert WKB geometry → native GeoArrow (same as Go kernels)
     if geom_fields:
-        schema = _add_geo_metadata(schema, geom_fields)
+        from .geoarrow import convert_batch as geo_convert
+        batches = [geo_convert(b, geom_fields) for b in batches]
+        if batches:
+            schema = batches[0].schema
 
     tmp_path = path + ".tmp"
     try:
