@@ -1,5 +1,6 @@
 from typing import Dict, Any, List, Union
 import requests
+import urllib3
 import pyarrow as pa
 import pandas as pd
 import geopandas as gpd
@@ -714,21 +715,23 @@ class HugrClient:
         token: str = None,
         role: str = None,
         connection: str = None,
+        tls_skip_verify: bool = False,
     ):
         self._connection_name = None
+        self._tls_skip_verify = tls_skip_verify
 
         # Priority 1: named connection from connections.json
         if connection is not None:
             self._apply_connection(connection if isinstance(connection, str) else None,
                                    connection if isinstance(connection, dict) else None,
-                                   url, api_key, api_key_header, token, role)
+                                   url, api_key, api_key_header, token, role, tls_skip_verify)
         else:
             # Priority 2: default connection from connections.json
             if not url:
                 try:
                     from .connections import get_connection
                     conn = get_connection()
-                    self._apply_connection(None, conn, url, api_key, api_key_header, token, role)
+                    self._apply_connection(None, conn, url, api_key, api_key_header, token, role, tls_skip_verify)
                     return
                 except (ValueError, FileNotFoundError):
                     pass
@@ -753,13 +756,14 @@ class HugrClient:
             )
             self._role_header = os.environ.get("HUGR_ROLE_HEADER", "X-Hugr-Role")
 
-    def _apply_connection(self, name, conn_dict, url, api_key, api_key_header, token, role):
+    def _apply_connection(self, name, conn_dict, url, api_key, api_key_header, token, role, tls_skip_verify=False):
         """Apply connection config from connections.json, with explicit args taking priority."""
         if conn_dict is None:
             from .connections import get_connection
             conn_dict = get_connection(name)
 
         self._connection_name = conn_dict.get("name")
+        self._tls_skip_verify = tls_skip_verify or conn_dict.get("tls_skip_verify", False)
         self._url = url or conn_dict.get("url")
         self._role = role or conn_dict.get("role")
         self._role_header = os.environ.get("HUGR_ROLE_HEADER", "X-Hugr-Role")
@@ -810,7 +814,10 @@ class HugrClient:
     def query(self, query: str, variables: dict = None):
         headers = self._headers()
         payload = {"query": query, "variables": variables or {}}
-        resp = requests.post(self._url, headers=headers, json=payload)
+        verify = not self._tls_skip_verify
+        if self._tls_skip_verify:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        resp = requests.post(self._url, headers=headers, json=payload, verify=verify)
 
         # Token may have been refreshed by connection service — re-read and retry
         if resp.status_code == 401 and self._connection_name:
@@ -821,7 +828,7 @@ class HugrClient:
                 if new_token and new_token != self._token:
                     self._token = new_token
                     headers = self._headers()
-                    resp = requests.post(self._url, headers=headers, json=payload)
+                    resp = requests.post(self._url, headers=headers, json=payload, verify=verify)
             except (ValueError, FileNotFoundError):
                 pass
 

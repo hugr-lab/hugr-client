@@ -1,5 +1,6 @@
 import asyncio
 import json
+import ssl
 import websockets
 import pandas as pd
 import pyarrow as pa
@@ -113,6 +114,7 @@ class HugrStreamingClient:
         token: str = None,
         role: str = None,
         max_frame_size: int = 128 * 1024 * 1024,
+        tls_skip_verify: bool = False,
     ):
         if not url:
             url = os.environ.get("HUGR_URL")
@@ -154,6 +156,7 @@ class HugrStreamingClient:
         self._connected = False
         self._query_active = False
         self._max_frame_size = max_frame_size
+        self._tls_skip_verify = tls_skip_verify
 
     async def connect(self):
         """Establish WebSocket connection"""
@@ -162,15 +165,26 @@ class HugrStreamingClient:
 
         headers = self._headers
 
+        # Build SSL context for wss:// with optional cert skip
+        ssl_ctx = None
+        if self.ws_url.startswith("wss://"):
+            if self._tls_skip_verify:
+                ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+            else:
+                ssl_ctx = True  # default verification
+
         try:
             # Try newer websockets API first
             self.websocket = await websockets.connect(
                 self.ws_url,
                 additional_headers=headers,
+                ssl=ssl_ctx,
                 ping_interval=30,
                 ping_timeout=10,
                 close_timeout=10,
-                max_size=self._max_frame_size,  # Customizable max message size
+                max_size=self._max_frame_size,
             )
         except TypeError:
             # Fallback for older websockets versions
@@ -178,13 +192,14 @@ class HugrStreamingClient:
                 self.websocket = await websockets.connect(
                     self.ws_url,
                     extra_headers=headers,
+                    ssl=ssl_ctx,
                     ping_interval=30,
                     ping_timeout=10,
-                    max_size=self._max_frame_size,  # Customizable max message size
+                    max_size=self._max_frame_size,
                 )
             except TypeError:
                 # Last resort - no headers in connection
-                self.websocket = await websockets.connect(self.ws_url)
+                self.websocket = await websockets.connect(self.ws_url, ssl=ssl_ctx)
 
         self._connected = True
         logger.info("WebSocket connection established")
@@ -307,7 +322,8 @@ class HugrStreamConnection(HugrClient):
     def _get_streaming_client(self):
         if not self._streaming_client:
             self._streaming_client = HugrStreamingClient(
-                self._url, self._headers(), max_frame_size=self._max_frame_size
+                self._url, self._headers(), max_frame_size=self._max_frame_size,
+                tls_skip_verify=getattr(self, '_tls_skip_verify', False),
             )
         return self._streaming_client
 
@@ -356,9 +372,11 @@ def connect_stream(
     token: str = None,
     role: str = None,
     max_frame_size: int = 128 * 1024 * 1024,
+    tls_skip_verify: bool = False,
 ) -> HugrStreamConnection:
     return HugrStreamConnection(
-        url, api_key, api_key_header, token, role, max_frame_size=max_frame_size
+        url, api_key, api_key_header, token, role, max_frame_size=max_frame_size,
+        tls_skip_verify=tls_skip_verify,
     )
 
 
@@ -366,7 +384,8 @@ def new_stream_connection(client: HugrClient) -> HugrStreamConnection:
     """Get streaming client from existing HugrClient"""
     if not isinstance(client, HugrStreamConnection):
         client = HugrStreamConnection(
-            client._url, client._api_key, client._api_key_header, client._token, client._role
+            client._url, client._api_key, client._api_key_header, client._token, client._role,
+            tls_skip_verify=getattr(client, '_tls_skip_verify', False),
         )
     return client
 
