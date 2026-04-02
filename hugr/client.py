@@ -1,4 +1,5 @@
 from typing import Dict, Any, List, Union
+import datetime
 import requests
 import urllib3
 import pyarrow as pa
@@ -12,6 +13,33 @@ from requests_toolbelt.multipart import decoder
 from shapely import wkb
 from shapely.geometry import shape, mapping
 from shapely.geometry.base import BaseGeometry
+
+
+def _detect_local_timezone():
+    """Detect the local IANA timezone name. Returns None if detection fails."""
+    try:
+        tz = datetime.datetime.now().astimezone().tzinfo
+        if tz is None:
+            return None
+        # Python 3.9+ zoneinfo zones have .key
+        if hasattr(tz, 'key'):
+            return tz.key
+        # Try tzlocal if available
+        try:
+            from tzlocal import get_localzone
+            zone = get_localzone()
+            if hasattr(zone, 'key'):
+                return zone.key
+            return str(zone)
+        except ImportError:
+            pass
+        # Fallback: TZ env var
+        tz_env = os.environ.get("TZ")
+        if tz_env and "/" in tz_env:
+            return tz_env
+        return None
+    except Exception:
+        return None
 
 _table_html_limit = 20
 
@@ -715,9 +743,16 @@ class HugrClient:
         token: str = None,
         role: str = None,
         connection: str = None,
+        timezone: str = None,
+        timezone_header: str = None,
         tls_skip_verify: bool = False,
     ):
         self._connection_name = None
+        self._timezone = timezone or os.environ.get("HUGR_TIMEZONE") or _detect_local_timezone()
+        self._timezone_header = (
+            timezone_header
+            or os.environ.get("HUGR_TIMEZONE_HEADER", "X-Hugr-Timezone")
+        )
         self._tls_skip_verify = tls_skip_verify
 
         # Priority 1: named connection from connections.json
@@ -809,6 +844,8 @@ class HugrClient:
             headers["Authorization"] = f"Bearer {self._token}"
         if self._role:
             headers[self._role_header] = self._role
+        if self._timezone:
+            headers[self._timezone_header] = self._timezone
         return headers
 
     def query(self, query: str, variables: dict = None):
@@ -858,8 +895,11 @@ def query(
     api_key_header: str = None,
     token: str = None,
     role: str = None,
+    timezone: str = None,
+    timezone_header: str = None,
 ):
-    client = HugrClient(url=url, api_key=api_key, api_key_header=api_key_header, token=token, role=role)
+    client = HugrClient(url=url, api_key=api_key, api_key_header=api_key_header, token=token, role=role,
+                         timezone=timezone, timezone_header=timezone_header)
     return client.query(query, variables)
 
 
@@ -869,8 +909,11 @@ def connect(
     api_key_header: str = None,
     token: str = None,
     role: str = None,
+    timezone: str = None,
+    timezone_header: str = None,
 ):
-    return HugrClient(url, api_key, api_key_header, token, role)
+    return HugrClient(url, api_key, api_key_header, token, role,
+                       timezone=timezone, timezone_header=timezone_header)
 
 
 def explore_map(

@@ -113,6 +113,8 @@ class HugrStreamingClient:
         api_key_header: str = None,
         token: str = None,
         role: str = None,
+        timezone: str = None,
+        timezone_header: str = None,
         max_frame_size: int = 128 * 1024 * 1024,
         tls_skip_verify: bool = False,
     ):
@@ -130,6 +132,11 @@ class HugrStreamingClient:
         if role:
             role_header = os.environ.get("HUGR_ROLE_HEADER", "X-Hugr-Role")
             headers[role_header] = role
+        from hugr.client import _detect_local_timezone
+        timezone = timezone or os.environ.get("HUGR_TIMEZONE") or _detect_local_timezone()
+        if timezone:
+            tz_header = timezone_header or os.environ.get("HUGR_TIMEZONE_HEADER", "X-Hugr-Timezone")
+            headers[tz_header] = timezone
 
         self.base_url = url.rstrip('/') if url else None
 
@@ -373,10 +380,13 @@ def connect_stream(
     role: str = None,
     max_frame_size: int = 128 * 1024 * 1024,
     tls_skip_verify: bool = False,
+    timezone: str = None,
+    timezone_header: str = None,
 ) -> HugrStreamConnection:
     return HugrStreamConnection(
         url, api_key, api_key_header, token, role, max_frame_size=max_frame_size,
         tls_skip_verify=tls_skip_verify,
+        timezone=timezone, timezone_header=timezone_header,
     )
 
 
@@ -386,6 +396,8 @@ def new_stream_connection(client: HugrClient) -> HugrStreamConnection:
         client = HugrStreamConnection(
             client._url, client._api_key, client._api_key_header, client._token, client._role,
             tls_skip_verify=getattr(client, '_tls_skip_verify', False),
+            timezone=getattr(client, '_timezone', None),
+            timezone_header=getattr(client, '_timezone_header', None),
         )
     return client
 
