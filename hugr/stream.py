@@ -369,6 +369,164 @@ class HugrStreamConnection(HugrClient):
         return self._get_streaming_client()
 
 
+class HugrSubscription:
+    """A single subscription handle with async iteration over Arrow batches."""
+
+    def __init__(self, subscription_id: str, client: 'HugrStreamingClient'):
+        self.id = subscription_id
+        self._client = client
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._done = False
+        self._error = None
+        self._current_path = ""
+
+    async def chunks(self) -> AsyncGenerator[pa.RecordBatch, None]:
+        """Yield Arrow RecordBatches as they arrive."""
+        while not self._done:
+            item = await self._queue.get()
+            if item is None:
+                break
+            yield item
+
+    async def rows(self) -> AsyncGenerator[Dict[str, Any], None]:
+        """Yield rows as dicts."""
+        async for batch in self.chunks():
+            schema = batch.schema
+            for i in range(batch.num_rows):
+                yield {schema.field(j).name: batch.column(j)[i].as_py() for j in range(batch.num_columns)}
+
+    async def to_pandas(self) -> pd.DataFrame:
+        """Collect all batches into a pandas DataFrame."""
+        batches = [b async for b in self.chunks()]
+        if not batches:
+            return pd.DataFrame()
+        return pa.Table.from_batches(batches).to_pandas()
+
+    async def cancel(self):
+        """Cancel the subscription."""
+        if self._client and self._client.websocket:
+            try:
+                await self._client.websocket.send(json.dumps({
+                    "type": "unsubscribe",
+                    "subscription_id": self.id,
+                }))
+            except Exception:
+                pass
+        self._done = True
+        await self._queue.put(None)
+
+    def _push_batch(self, batch: pa.RecordBatch):
+        """Push a batch to the queue (called by message router)."""
+        self._queue.put_nowait(batch)
+
+    def _complete(self, error: str = None):
+        """Mark subscription as complete."""
+        self._done = True
+        self._error = error
+        self._queue.put_nowait(None)
+
+
+# --- Subscription support on HugrStreamingClient ---
+
+async def _subscribe(self: HugrStreamingClient, query: str, variables: dict = None) -> HugrSubscription:
+    """Subscribe to a GraphQL subscription query. Returns HugrSubscription for async iteration."""
+    if not self._connected:
+        await self.connect()
+
+    import uuid
+    sub_id = str(uuid.uuid4())
+    sub = HugrSubscription(sub_id, self)
+
+    # Register subscription
+    if not hasattr(self, '_subscriptions'):
+        self._subscriptions = {}
+        # Start message router on first subscribe
+        self._router_task = asyncio.create_task(_subscription_router(self))
+    self._subscriptions[sub_id] = sub
+
+    # Send subscribe message
+    await self.websocket.send(json.dumps({
+        "type": "subscribe",
+        "subscription_id": sub_id,
+        "query": query,
+        "variables": variables or {},
+    }))
+
+    return sub
+
+
+async def _subscription_router(client: HugrStreamingClient):
+    """Background task that routes incoming WebSocket messages to subscriptions."""
+    pending_sub_id = None
+    try:
+        while client._connected:
+            try:
+                message = await asyncio.wait_for(client.websocket.recv(), timeout=60)
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
+                break
+
+            if isinstance(message, bytes):
+                # Arrow IPC binary frame → route to pending subscription
+                if pending_sub_id and pending_sub_id in client._subscriptions:
+                    try:
+                        reader = pa.ipc.open_stream(message)
+                        for batch in reader.read_all().to_batches():
+                            client._subscriptions[pending_sub_id]._push_batch(batch)
+                    except Exception as e:
+                        logger.warning(f"Error parsing Arrow batch: {e}")
+                pending_sub_id = None
+            else:
+                # Text frame — control message
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = data.get("type", "")
+                sub_id = data.get("subscription_id", "")
+
+                if msg_type == "subscription_data":
+                    pending_sub_id = sub_id
+                elif msg_type == "part_start":
+                    if sub_id in client._subscriptions:
+                        client._subscriptions[sub_id]._current_path = data.get("path", "")
+                elif msg_type == "subscription_complete":
+                    if sub_id in client._subscriptions:
+                        client._subscriptions[sub_id]._complete()
+                        del client._subscriptions[sub_id]
+                elif msg_type == "subscription_error":
+                    if sub_id in client._subscriptions:
+                        client._subscriptions[sub_id]._complete(error=data.get("error"))
+                        del client._subscriptions[sub_id]
+                elif msg_type == "complete":
+                    # Regular query complete — pass through for non-subscription handling
+                    if hasattr(client, '_query_active'):
+                        client._query_active = False
+    except Exception as e:
+        logger.warning(f"Subscription router error: {e}")
+    finally:
+        # Complete all remaining subscriptions
+        subs = getattr(client, '_subscriptions', {})
+        for sub in subs.values():
+            sub._complete(error="connection closed")
+        subs.clear()
+
+
+# Monkey-patch subscribe onto HugrStreamingClient
+HugrStreamingClient.subscribe = _subscribe
+
+
+# Also add to HugrStreamConnection
+async def _stream_conn_subscribe(self: HugrStreamConnection, query: str, variables: dict = None) -> HugrSubscription:
+    """Subscribe via streaming client."""
+    client = self._get_streaming_client()
+    return await client.subscribe(query, variables)
+
+HugrStreamConnection.subscribe = _stream_conn_subscribe
+
+
 # Main interface
 
 
