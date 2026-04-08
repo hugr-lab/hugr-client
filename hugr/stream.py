@@ -369,19 +369,17 @@ class HugrStreamConnection(HugrClient):
         return self._get_streaming_client()
 
 
-class HugrSubscription:
-    """A single subscription handle with async iteration over Arrow batches."""
+class SubscriptionEvent:
+    """A single event from a subscription — one path with an async batch iterator.
+    Batches flow through all ticks. chunks() ends on subscription_complete."""
 
-    def __init__(self, subscription_id: str, client: 'HugrStreamingClient'):
-        self.id = subscription_id
-        self._client = client
+    def __init__(self, path: str):
+        self.path = path
         self._queue: asyncio.Queue = asyncio.Queue()
         self._done = False
-        self._error = None
-        self._current_path = ""
 
     async def chunks(self) -> AsyncGenerator[pa.RecordBatch, None]:
-        """Yield Arrow RecordBatches as they arrive."""
+        """Yield Arrow RecordBatches as they arrive across all ticks."""
         while not self._done:
             item = await self._queue.get()
             if item is None:
@@ -402,6 +400,35 @@ class HugrSubscription:
             return pd.DataFrame()
         return pa.Table.from_batches(batches).to_pandas()
 
+    def _push(self, batch: pa.RecordBatch):
+        self._queue.put_nowait(batch)
+
+    def _close(self):
+        if not self._done:
+            self._done = True
+            self._queue.put_nowait(None)
+
+
+class HugrSubscription:
+    """A subscription handle that yields SubscriptionEvents (one per unique path).
+    Each event has a reader that spans all ticks until subscription completes."""
+
+    def __init__(self, subscription_id: str, client: 'HugrStreamingClient'):
+        self.id = subscription_id
+        self._client = client
+        self._events: asyncio.Queue = asyncio.Queue()
+        self._pipes: Dict[str, SubscriptionEvent] = {}
+        self._done = False
+        self._error = None
+
+    async def events(self) -> AsyncGenerator['SubscriptionEvent', None]:
+        """Yield SubscriptionEvents (one per unique path)."""
+        while not self._done:
+            item = await self._events.get()
+            if item is None:
+                break
+            yield item
+
     async def cancel(self):
         """Cancel the subscription."""
         if self._client and self._client.websocket:
@@ -412,24 +439,30 @@ class HugrSubscription:
                 }))
             except Exception:
                 pass
-        self._done = True
-        await self._queue.put(None)
+        self._complete()
 
-    def _push_batch(self, batch: pa.RecordBatch):
-        """Push a batch to the queue (called by message router)."""
-        self._queue.put_nowait(batch)
+    def _get_or_create_pipe(self, path: str) -> SubscriptionEvent:
+        if path in self._pipes:
+            return self._pipes[path]
+        event = SubscriptionEvent(path)
+        self._pipes[path] = event
+        self._events.put_nowait(event)
+        return event
 
     def _complete(self, error: str = None):
-        """Mark subscription as complete."""
+        if self._done:
+            return
         self._done = True
         self._error = error
-        self._queue.put_nowait(None)
+        for pipe in self._pipes.values():
+            pipe._close()
+        self._events.put_nowait(None)
 
 
 # --- Subscription support on HugrStreamingClient ---
 
 async def _subscribe(self: HugrStreamingClient, query: str, variables: dict = None) -> HugrSubscription:
-    """Subscribe to a GraphQL subscription query. Returns HugrSubscription for async iteration."""
+    """Subscribe to a GraphQL subscription query."""
     if not self._connected:
         await self.connect()
 
@@ -437,14 +470,11 @@ async def _subscribe(self: HugrStreamingClient, query: str, variables: dict = No
     sub_id = str(uuid.uuid4())
     sub = HugrSubscription(sub_id, self)
 
-    # Register subscription
     if not hasattr(self, '_subscriptions'):
         self._subscriptions = {}
-        # Start message router on first subscribe
         self._router_task = asyncio.create_task(_subscription_router(self))
     self._subscriptions[sub_id] = sub
 
-    # Send subscribe message
     await self.websocket.send(json.dumps({
         "type": "subscribe",
         "subscription_id": sub_id,
@@ -456,8 +486,7 @@ async def _subscribe(self: HugrStreamingClient, query: str, variables: dict = No
 
 
 async def _subscription_router(client: HugrStreamingClient):
-    """Background task that routes incoming WebSocket messages to subscriptions."""
-    pending_sub_id = None
+    """Routes incoming WebSocket messages to subscriptions by Arrow schema metadata."""
     try:
         while client._connected:
             try:
@@ -468,17 +497,21 @@ async def _subscription_router(client: HugrStreamingClient):
                 break
 
             if isinstance(message, bytes):
-                # Arrow IPC binary frame → route to pending subscription
-                if pending_sub_id and pending_sub_id in client._subscriptions:
-                    try:
-                        reader = pa.ipc.open_stream(message)
+                try:
+                    reader = pa.ipc.open_stream(message)
+                    schema = reader.schema
+                    meta = schema.metadata or {}
+                    sub_id = meta.get(b"subscription_id", b"").decode()
+                    path = meta.get(b"path", b"").decode()
+
+                    if sub_id and sub_id in client._subscriptions:
+                        sub = client._subscriptions[sub_id]
+                        pipe = sub._get_or_create_pipe(path)
                         for batch in reader.read_all().to_batches():
-                            client._subscriptions[pending_sub_id]._push_batch(batch)
-                    except Exception as e:
-                        logger.warning(f"Error parsing Arrow batch: {e}")
-                pending_sub_id = None
+                            pipe._push(batch)
+                except Exception as e:
+                    logger.warning(f"Error parsing Arrow batch: {e}")
             else:
-                # Text frame — control message
                 try:
                     data = json.loads(message)
                 except json.JSONDecodeError:
@@ -487,12 +520,7 @@ async def _subscription_router(client: HugrStreamingClient):
                 msg_type = data.get("type", "")
                 sub_id = data.get("subscription_id", "")
 
-                if msg_type == "subscription_data":
-                    pending_sub_id = sub_id
-                elif msg_type == "part_start":
-                    if sub_id in client._subscriptions:
-                        client._subscriptions[sub_id]._current_path = data.get("path", "")
-                elif msg_type == "subscription_complete":
+                if msg_type == "subscription_complete":
                     if sub_id in client._subscriptions:
                         client._subscriptions[sub_id]._complete()
                         del client._subscriptions[sub_id]
@@ -500,25 +528,23 @@ async def _subscription_router(client: HugrStreamingClient):
                     if sub_id in client._subscriptions:
                         client._subscriptions[sub_id]._complete(error=data.get("error"))
                         del client._subscriptions[sub_id]
+                elif msg_type == "part_complete":
+                    pass  # marker between ticks, pipes stay open
                 elif msg_type == "complete":
-                    # Regular query complete — pass through for non-subscription handling
                     if hasattr(client, '_query_active'):
                         client._query_active = False
     except Exception as e:
         logger.warning(f"Subscription router error: {e}")
     finally:
-        # Complete all remaining subscriptions
         subs = getattr(client, '_subscriptions', {})
         for sub in subs.values():
             sub._complete(error="connection closed")
         subs.clear()
 
 
-# Monkey-patch subscribe onto HugrStreamingClient
 HugrStreamingClient.subscribe = _subscribe
 
 
-# Also add to HugrStreamConnection
 async def _stream_conn_subscribe(self: HugrStreamConnection, query: str, variables: dict = None) -> HugrSubscription:
     """Subscribe via streaming client."""
     client = self._get_streaming_client()
