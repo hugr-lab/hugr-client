@@ -1,6 +1,7 @@
 import asyncio
 import json
 import ssl
+import uuid
 import websockets
 import pandas as pd
 import pyarrow as pa
@@ -308,6 +309,78 @@ class HugrStreamingClient:
         finally:
             self._query_active = False
 
+    # --- Subscriptions ---
+
+    async def subscribe(self, query: str, variables: dict = None) -> 'HugrSubscription':
+        """Subscribe to a GraphQL subscription query.
+        Returns HugrSubscription for async iteration over events."""
+        if not self._connected:
+            await self.connect()
+
+        sub_id = str(uuid.uuid4())
+        sub = HugrSubscription(sub_id, self)
+
+        if not hasattr(self, '_subscriptions'):
+            self._subscriptions: Dict[str, 'HugrSubscription'] = {}
+            self._router_task = asyncio.create_task(self._subscription_router())
+        self._subscriptions[sub_id] = sub
+
+        await self.websocket.send(json.dumps({
+            "type": "subscribe",
+            "subscription_id": sub_id,
+            "query": query,
+            "variables": variables or {},
+        }))
+        return sub
+
+    async def _subscription_router(self):
+        """Routes incoming WebSocket messages to subscriptions by Arrow schema metadata."""
+        try:
+            while self._connected:
+                try:
+                    message = await asyncio.wait_for(self.websocket.recv(), timeout=60)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    break
+
+                if isinstance(message, bytes):
+                    try:
+                        reader = pa.ipc.open_stream(message)
+                        meta = reader.schema.metadata or {}
+                        sub_id = meta.get(b"subscription_id", b"").decode()
+                        path = meta.get(b"path", b"").decode()
+                        if sub_id and sub_id in self._subscriptions:
+                            pipe = self._subscriptions[sub_id]._get_or_create_pipe(path)
+                            for batch in reader.read_all().to_batches():
+                                pipe._push(batch)
+                    except Exception as e:
+                        logger.warning(f"Error parsing Arrow batch: {e}")
+                else:
+                    try:
+                        data = json.loads(message)
+                    except json.JSONDecodeError:
+                        continue
+                    msg_type = data.get("type", "")
+                    sub_id = data.get("subscription_id", "")
+                    if msg_type == "subscription_complete":
+                        if sub_id in self._subscriptions:
+                            self._subscriptions.pop(sub_id)._complete()
+                    elif msg_type == "subscription_error":
+                        if sub_id in self._subscriptions:
+                            self._subscriptions.pop(sub_id)._complete(error=data.get("error"))
+                    elif msg_type == "part_complete":
+                        pass  # marker between ticks, pipes stay open
+                    elif msg_type == "complete":
+                        self._query_active = False
+        except Exception as e:
+            logger.warning(f"Subscription router error: {e}")
+        finally:
+            for sub in getattr(self, '_subscriptions', {}).values():
+                sub._complete(error="connection closed")
+            if hasattr(self, '_subscriptions'):
+                self._subscriptions.clear()
+
     async def __aenter__(self):
         await self.connect()
         return self
@@ -364,9 +437,104 @@ class HugrStreamConnection(HugrClient):
         client = self._get_streaming_client()
         return await client.stream_data_object(data_object, fields, variables)
 
+    async def subscribe(self, query: str, variables: dict = None) -> 'HugrSubscription':
+        """Subscribe via streaming client (auto-connects)."""
+        client = self._get_streaming_client()
+        return await client.subscribe(query, variables)
+
     async def streaming_context(self):
         """Get streaming client for manual connection management"""
         return self._get_streaming_client()
+
+
+class SubscriptionEvent:
+    """A single event from a subscription — one path with an async batch iterator.
+    Batches flow through all ticks. chunks() ends on subscription_complete."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._closed = False
+
+    async def chunks(self) -> AsyncGenerator[pa.RecordBatch, None]:
+        """Yield Arrow RecordBatches as they arrive across all ticks."""
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                break
+            yield item
+
+    async def rows(self) -> AsyncGenerator[Dict[str, Any], None]:
+        """Yield rows as dicts."""
+        async for batch in self.chunks():
+            schema = batch.schema
+            for i in range(batch.num_rows):
+                yield {schema.field(j).name: batch.column(j)[i].as_py() for j in range(batch.num_columns)}
+
+    async def to_pandas(self) -> pd.DataFrame:
+        """Collect all batches into a pandas DataFrame."""
+        batches = [b async for b in self.chunks()]
+        if not batches:
+            return pd.DataFrame()
+        return pa.Table.from_batches(batches).to_pandas()
+
+    def _push(self, batch: pa.RecordBatch):
+        self._queue.put_nowait(batch)
+
+    def _close(self):
+        if not self._closed:
+            self._closed = True
+            self._queue.put_nowait(None)
+
+
+class HugrSubscription:
+    """A subscription handle that yields SubscriptionEvents (one per unique path).
+    Each event has a reader that spans all ticks until subscription completes."""
+
+    def __init__(self, subscription_id: str, client: 'HugrStreamingClient'):
+        self.id = subscription_id
+        self._client = client
+        self._events: asyncio.Queue = asyncio.Queue()
+        self._pipes: Dict[str, SubscriptionEvent] = {}
+        self._done = False
+        self._error = None
+
+    async def events(self) -> AsyncGenerator['SubscriptionEvent', None]:
+        """Yield SubscriptionEvents (one per unique path)."""
+        while True:
+            item = await self._events.get()
+            if item is None:
+                break
+            yield item
+
+    async def cancel(self):
+        """Cancel the subscription."""
+        if self._client and self._client.websocket:
+            try:
+                await self._client.websocket.send(json.dumps({
+                    "type": "unsubscribe",
+                    "subscription_id": self.id,
+                }))
+            except Exception:
+                pass
+        self._complete()
+
+    def _get_or_create_pipe(self, path: str) -> SubscriptionEvent:
+        if path in self._pipes:
+            return self._pipes[path]
+        event = SubscriptionEvent(path)
+        self._pipes[path] = event
+        self._events.put_nowait(event)
+        return event
+
+    def _complete(self, error: str = None):
+        if self._done:
+            return
+        self._done = True
+        self._error = error
+        for pipe in self._pipes.values():
+            pipe._close()
+        self._events.put_nowait(None)
 
 
 # Main interface

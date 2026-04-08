@@ -12,6 +12,8 @@ from .stream import (
     HugrStreamConnection,
     HugrStreamingClient,
     HugrStream,
+    HugrSubscription,
+    SubscriptionEvent,
     connect_stream,
     new_stream_connection,
 )
@@ -27,6 +29,8 @@ __all__ = [
     "HugrStreamConnection",
     "HugrStreamingClient",
     "HugrStream",
+    "HugrSubscription",
+    "SubscriptionEvent",
     "connect_stream",
     "new_stream_connection",
 ]
