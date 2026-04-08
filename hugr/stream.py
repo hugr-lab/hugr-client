@@ -380,7 +380,7 @@ class SubscriptionEvent:
 
     async def chunks(self) -> AsyncGenerator[pa.RecordBatch, None]:
         """Yield Arrow RecordBatches as they arrive across all ticks."""
-        while not self._done:
+        while True:
             item = await self._queue.get()
             if item is None:
                 break
@@ -423,7 +423,7 @@ class HugrSubscription:
 
     async def events(self) -> AsyncGenerator['SubscriptionEvent', None]:
         """Yield SubscriptionEvents (one per unique path)."""
-        while not self._done:
+        while True:
             item = await self._events.get()
             if item is None:
                 break
