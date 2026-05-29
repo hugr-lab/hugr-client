@@ -887,10 +887,11 @@ class HugrClient:
     def ingest(self, data_object: str, data) -> dict:
         """Bulk-insert tabular data into a hugr data object via /ipc/ingest.
 
-        The data is serialised as an Apache Arrow IPC stream and POSTed to the
-        server, which resolves the columns against the target table's schema
-        and runs a single INSERT ... SELECT. This is dramatically faster than
-        row-by-row GraphQL `insert_*` mutations for bulk loads.
+        The data is serialised as an Apache Arrow IPC stream and streamed to
+        the server batch-by-batch (chunked transfer encoding), which resolves
+        the columns against the target table's schema and runs a single
+        INSERT ... SELECT. Dramatically faster than row-by-row GraphQL
+        `insert_*` mutations for bulk loads.
 
         Args:
             data_object: dotted GraphQL Query path (e.g. "pg_store.public.events")
@@ -899,12 +900,17 @@ class HugrClient:
                 - pandas.DataFrame
                 - pyarrow.Table
                 - pyarrow.RecordBatch
-                - pyarrow.RecordBatchReader (drained into memory)
+                - pyarrow.RecordBatchReader — consumed lazily, one batch at a
+                  time, so a reader backed by a file/stream larger than RAM is
+                  ingested with bounded (~one batch) memory.
 
         Returns:
             dict with keys "data_object", "inserted" (int), "columns" (list).
 
         Notes:
+            - The request body is a single-use stream. A 401 is surfaced as an
+              error (no automatic token-refresh retry, since the body cannot be
+              replayed) — re-auth and call again.
             - Arrow column names must match insertable fields of the target
               table; computed/virtual/reference fields are rejected server-side.
             - INSERT only — no upsert/merge/on-conflict in this version.
@@ -914,12 +920,7 @@ class HugrClient:
         if not data_object:
             raise ValueError("data_object is required")
 
-        table = _to_arrow_table(data)
-
-        sink = pa.BufferOutputStream()
-        with pa.ipc.new_stream(sink, table.schema) as writer:
-            writer.write_table(table)
-        body = sink.getvalue().to_pybytes()
+        schema, batches = _to_batches(data)
 
         url = self._ingest_url(data_object)
         headers = self._ingest_headers()
@@ -927,20 +928,8 @@ class HugrClient:
         if self._tls_skip_verify:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+        body = _arrow_ipc_stream_gen(schema, batches)
         resp = requests.post(url, headers=headers, data=body, verify=verify)
-
-        # Token may have been refreshed by connection service — retry once.
-        if resp.status_code == 401 and self._connection_name:
-            try:
-                from .connections import get_connection
-                conn = get_connection(self._connection_name)
-                new_token = (conn.get("tokens") or {}).get("access_token")
-                if new_token and new_token != self._token:
-                    self._token = new_token
-                    headers = self._ingest_headers()
-                    resp = requests.post(url, headers=headers, data=body, verify=verify)
-            except (ValueError, FileNotFoundError):
-                pass
 
         if resp.status_code == 401:
             raise PermissionError(
@@ -1018,8 +1007,13 @@ def connect(
                        timezone=timezone, timezone_header=timezone_header)
 
 
-def _to_arrow_table(data) -> pa.Table:
-    """Coerce supported inputs into a pyarrow.Table for ingestion."""
+def _to_batches(data):
+    """Coerce supported inputs into (schema, batches_iterable).
+
+    For in-memory inputs (DataFrame/Table/RecordBatch) the iterable is a list
+    of zero-copy batches. For a pyarrow.RecordBatchReader the reader itself is
+    returned, so it is consumed lazily — never materialised in full.
+    """
     # GeoDataFrame is a pandas.DataFrame subclass — check it first and reject
     # with a clear message, otherwise from_pandas would mangle the geometry.
     if isinstance(data, gpd.GeoDataFrame):
@@ -1028,20 +1022,94 @@ def _to_arrow_table(data) -> pa.Table:
             "columns to WKB and pass a plain DataFrame or pyarrow.Table"
         )
     if isinstance(data, pa.Table):
-        return data
+        return data.schema, data.to_batches()
     if isinstance(data, pa.RecordBatch):
-        return pa.Table.from_batches([data])
+        return data.schema, [data]
     if isinstance(data, pa.RecordBatchReader):
-        return data.read_all()
+        # Lazy: the reader is iterated one batch at a time by the stream
+        # generator; we never call read_all().
+        return data.schema, data
     if isinstance(data, pd.DataFrame):
         # preserve_index=False so we don't emit an __index_level_0__ column
         # that won't match the target table's schema.
-        return pa.Table.from_pandas(data, preserve_index=False)
+        table = pa.Table.from_pandas(data, preserve_index=False)
+        return table.schema, table.to_batches()
     raise TypeError(
         f"Unsupported data type for ingest: {type(data).__name__}. "
         "Expected pandas.DataFrame, pyarrow.Table, pyarrow.RecordBatch, "
         "or pyarrow.RecordBatchReader."
     )
+
+
+class _IpcStreamSink:
+    """Minimal write-only file-like that buffers Arrow IPC writer output so a
+    generator can drain it incrementally. tell() returns a running byte count
+    (the IPC stream writer is sequential; we never seek), which avoids the
+    ESPIPE a real pipe would raise."""
+
+    def __init__(self):
+        self._chunks = []
+        self._pos = 0
+
+    def write(self, b):
+        b = bytes(b)
+        self._chunks.append(b)
+        self._pos += len(b)
+        return len(b)
+
+    def flush(self):
+        pass
+
+    def tell(self):
+        return self._pos
+
+    def writable(self):
+        return True
+
+    def readable(self):
+        return False
+
+    def seekable(self):
+        return False
+
+    @property
+    def closed(self):
+        return False
+
+    def close(self):
+        pass
+
+    def drain(self):
+        if not self._chunks:
+            return b""
+        out = b"".join(self._chunks)
+        self._chunks.clear()
+        return out
+
+
+def _arrow_ipc_stream_gen(schema, batches):
+    """Yield an Arrow IPC stream as a sequence of byte chunks, serialising one
+    record batch at a time. Used as a streaming request body so peak memory
+    stays ~one batch regardless of total size. requests pulls each chunk
+    lazily and sends it (chunked transfer encoding) before the next batch is
+    serialised."""
+    sink = _IpcStreamSink()
+    writer = pa.ipc.new_stream(sink, schema)
+    # The schema message is written at construction — emit it first.
+    head = sink.drain()
+    if head:
+        yield head
+    try:
+        for batch in batches:
+            writer.write_batch(batch)
+            chunk = sink.drain()
+            if chunk:
+                yield chunk
+    finally:
+        writer.close()
+    tail = sink.drain()
+    if tail:
+        yield tail
 
 
 def ingest(

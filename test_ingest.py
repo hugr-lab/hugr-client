@@ -16,7 +16,7 @@ import pyarrow as pa
 import pandas as pd
 
 import hugr
-from hugr.client import HugrClient, _to_arrow_table
+from hugr.client import HugrClient, _to_batches
 
 
 def _fake_response(status=200, payload=None, text=""):
@@ -29,10 +29,12 @@ def _fake_response(status=200, payload=None, text=""):
 
 
 def _decode_ingest_body(call) -> pa.Table:
-    """Extract the Arrow IPC stream POSTed by the client and decode it."""
+    """Extract the Arrow IPC stream POSTed by the client and decode it. The
+    body is a generator (streaming/chunked), so join its chunks first."""
     body = call.kwargs.get("data")
     assert body is not None, "request body (data=) must be set"
-    reader = pa.ipc.open_stream(io.BytesIO(body))
+    raw = body if isinstance(body, (bytes, bytearray)) else b"".join(body)
+    reader = pa.ipc.open_stream(io.BytesIO(raw))
     return reader.read_all()
 
 
@@ -64,37 +66,47 @@ def test_ingest_url_encodes_dotted_path():
 
 # --- type coercion ---------------------------------------------------------
 
-def test_to_arrow_from_dataframe_drops_index():
+def _materialize(schema, batches):
+    return pa.Table.from_batches(list(batches), schema=schema)
+
+
+def test_to_batches_from_dataframe_drops_index():
     df = pd.DataFrame({"name": ["a", "b"], "value": [1.0, 2.0]})
-    tbl = _to_arrow_table(df)
-    assert tbl.num_rows == 2
+    schema, batches = _to_batches(df)
     # No __index_level_0__ leaking through.
-    assert tbl.schema.names == ["name", "value"]
+    assert schema.names == ["name", "value"]
+    assert _materialize(schema, batches).num_rows == 2
 
 
-def test_to_arrow_from_table_passthrough():
+def test_to_batches_from_table():
     tbl = pa.table({"x": [1, 2, 3]})
-    assert _to_arrow_table(tbl) is tbl
+    schema, batches = _to_batches(tbl)
+    assert schema == tbl.schema
+    assert _materialize(schema, batches).num_rows == 3
 
 
-def test_to_arrow_from_record_batch():
+def test_to_batches_from_record_batch():
     rb = pa.record_batch({"x": [1, 2]})
-    tbl = _to_arrow_table(rb)
-    assert tbl.num_rows == 2
+    schema, batches = _to_batches(rb)
+    assert _materialize(schema, batches).num_rows == 2
 
 
-def test_to_arrow_from_record_batch_reader():
+def test_to_batches_from_record_batch_reader_is_lazy():
     schema = pa.schema([("x", pa.int64())])
     batches = [pa.record_batch({"x": [1, 2]}, schema=schema),
                pa.record_batch({"x": [3]}, schema=schema)]
     rbr = pa.RecordBatchReader.from_batches(schema, batches)
-    tbl = _to_arrow_table(rbr)
-    assert tbl.num_rows == 3
+    out_schema, out_batches = _to_batches(rbr)
+    # Crucial: the reader is returned as-is (lazy), NOT drained via read_all().
+    assert out_batches is rbr
+    assert out_schema == schema
+    # Consuming it still yields all rows.
+    assert _materialize(out_schema, out_batches).num_rows == 3
 
 
-def test_to_arrow_rejects_unsupported():
+def test_to_batches_rejects_unsupported():
     try:
-        _to_arrow_table([1, 2, 3])
+        _to_batches([1, 2, 3])
     except TypeError as e:
         assert "Unsupported data type" in str(e)
     else:

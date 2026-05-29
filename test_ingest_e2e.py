@@ -24,7 +24,9 @@ against a live server. run_e2e.sh orchestrates postgres + dev-server + this
 script for a one-command reproduction.
 """
 import datetime as dt
+import json
 import os
+import subprocess
 import sys
 import time
 
@@ -187,6 +189,60 @@ def test_bulk(client, url: str, query_url: str):
     print("  PASS\n")
 
 
+def test_streaming_memory(url: str, query_url: str):
+    """Prove ingest streams a large RecordBatchReader with bounded memory.
+
+    Runs the ingest in a fresh subprocess (so peak RSS reflects only that work)
+    that builds a lazy reader producing ~DATA_MB of Arrow data and reports the
+    RSS it grew by. If the client buffered the whole stream (the old read_all +
+    full-buffer path) the delta would be >= the data size; streaming keeps it
+    to roughly one batch.
+    """
+    print("=== Test: streaming memory (lazy RecordBatchReader) ===")
+    num_batches = 128
+    rows_per_batch = 256
+    payload_bytes = 4096
+    approx_total_mb = num_batches * rows_per_batch * payload_bytes / (1024 * 1024)
+    expected_rows = num_batches * rows_per_batch
+
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mem_ingest_worker.py")
+    proc = subprocess.run(
+        [sys.executable, worker, url, "pg_ingest.events",
+         str(num_batches), str(rows_per_batch), str(payload_bytes)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(f"mem worker failed:\nSTDOUT:{proc.stdout}\nSTDERR:{proc.stderr}")
+    stats = json.loads(proc.stdout.strip().splitlines()[-1])
+    print(f"  worker stats: {stats}")
+
+    assert stats["inserted"] == expected_rows, stats
+
+    # Verify the rows actually landed (count through hugr).
+    agg = _gql(
+        query_url,
+        'query { pg_ingest { events_aggregation('
+        '  filter: {name: {like: "mem-%"}}'
+        ') { _rows_count } } }',
+    )
+    cnt = agg["pg_ingest"]["events_aggregation"]["_rows_count"]
+    assert cnt == expected_rows, f"expected {expected_rows} in pg, got {cnt}"
+
+    # The streaming assertion: memory growth must be a small fraction of the
+    # total streamed data. One batch is ~1MB here; allow generous headroom for
+    # pyarrow/requests scratch. A buffering implementation would grow by
+    # >= approx_total_mb (and ~2-3x with the old to_pybytes copy).
+    threshold_mb = max(64.0, approx_total_mb * 0.25)
+    assert stats["delta_mb"] < threshold_mb, (
+        f"memory grew {stats['delta_mb']}MB streaming ~{approx_total_mb:.0f}MB; "
+        f"expected < {threshold_mb:.0f}MB — looks like the stream was buffered, "
+        f"not streamed"
+    )
+    print(f"  OK: grew {stats['delta_mb']}MB streaming ~{approx_total_mb:.0f}MB "
+          f"(threshold {threshold_mb:.0f}MB)")
+    print("  PASS\n")
+
+
 def main():
     url = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("HUGR_E2E_URL", DEFAULT_URL)
     dsn = os.environ.get("HUGR_E2E_PG_DSN", DEFAULT_DSN)
@@ -203,6 +259,7 @@ def main():
     test_dataframe(client, url)
     test_arrow_table(client, url)
     test_bulk(client, url, query_url)
+    test_streaming_memory(url, query_url)
 
     print("All ingest e2e tests passed!")
 
