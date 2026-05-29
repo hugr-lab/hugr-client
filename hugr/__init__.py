@@ -5,6 +5,7 @@ from .client import (
     HugrIPCResponse,
     connect,
     query,
+    ingest,
     explore_map,
 )
 
@@ -25,6 +26,7 @@ __all__ = [
     "HugrIPCTable",
     "connect",
     "query",
+    "ingest",
     "explore_map",
     "HugrStreamConnection",
     "HugrStreamingClient",

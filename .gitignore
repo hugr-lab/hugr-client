@@ -9,5 +9,7 @@ build/
 .virtual_documents/
 *.ipynb
 .venv/
+.venv-e2e/
+.venv-test/
 
 examples
