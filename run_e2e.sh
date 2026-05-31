@@ -14,8 +14,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 QE="$(cd "$HERE/../hugr-query-engine" && pwd)"
-COMPOSE_FILE="$QE/integration-test/ingest/docker-compose.yml"
-SCHEMA_DIR="$QE/integration-test/ingest/testdata/schemas/pg_ingest"
+COMPOSE_FILE="$QE/integration-test/ingest-postgres/docker-compose.yml"
+SCHEMA_DIR="$QE/integration-test/ingest-postgres/testdata/schemas/pg_ingest"
 
 PORT="${HUGR_E2E_PORT:-15055}"
 URL="http://localhost:${PORT}/ipc"

@@ -45,7 +45,7 @@ def _default_schema_dir() -> str:
     # hugr-client and hugr-query-engine are sibling checkouts.
     return os.path.normpath(os.path.join(
         here, "..", "hugr-query-engine",
-        "integration-test", "ingest", "testdata", "schemas", "pg_ingest",
+        "integration-test", "ingest-postgres", "testdata", "schemas", "pg_ingest",
     ))
 
 
