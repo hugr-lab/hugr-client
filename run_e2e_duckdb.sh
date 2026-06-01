@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end runner for the Python ingest client against a DuckDB-backed
-# data source. Mirror of run_e2e.sh but without the postgres container —
+# data source. Mirror of run_e2e_postgres.sh but without the postgres container —
 # DuckDB is a local file the test seeds itself.
 #
 # Usage:

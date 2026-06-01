@@ -6,7 +6,7 @@ Usage:
 
 Default URL: http://localhost:15055/ipc
 
-Mirrors test_ingest_e2e.py (Postgres variant) — same three ingest paths
+Mirrors test_ingest_e2e_postgres.py — same three ingest paths
 (pandas DataFrame, pyarrow.Table, bulk 50k via RecordBatchReader) plus the
 streaming-memory subprocess test. Differences from the Postgres variant:
   - the backing store is a local .duckdb file in a tempdir (no docker);

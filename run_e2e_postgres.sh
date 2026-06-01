@@ -2,11 +2,11 @@
 # End-to-end runner for the Python ingest client.
 #
 # Brings up the postgres container + a hugr dev-server (built from the sibling
-# hugr-query-engine checkout), then runs test_ingest_e2e.py against it.
+# hugr-query-engine checkout), then runs test_ingest_e2e_postgres.py against it.
 #
 # Usage:
-#   ./run_e2e.sh          # full run with teardown
-#   ./run_e2e.sh keep     # leave postgres + dev-server running afterwards
+#   ./run_e2e_postgres.sh          # full run with teardown
+#   ./run_e2e_postgres.sh keep     # leave postgres + dev-server running afterwards
 #
 # Requires: docker, go (with CGo), python3. The sibling repo
 # ../hugr-query-engine must be present (for docker-compose, schema, dev-server).
@@ -67,4 +67,4 @@ fi
 
 echo "=== 5/5 run e2e ==="
 HUGR_E2E_URL="$URL" HUGR_E2E_PG_DSN="$DSN" HUGR_E2E_SCHEMA_DIR="$SCHEMA_DIR" \
-    "$VENV/bin/python" "$HERE/test_ingest_e2e.py" "$URL"
+    "$VENV/bin/python" "$HERE/test_ingest_e2e_postgres.py" "$URL"

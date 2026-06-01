@@ -2,7 +2,7 @@
 End-to-end test for HugrClient.ingest against a running hugr server.
 
 Usage:
-    python test_ingest_e2e.py [URL]
+    python test_ingest_e2e_postgres.py [URL]
 
 Default URL: http://localhost:15055/ipc
 
@@ -20,7 +20,7 @@ Environment:
                           (default: sibling hugr-query-engine ingest testdata)
 
 This mirrors the convention of test_subscription.py: a standalone script run
-against a live server. run_e2e.sh orchestrates postgres + dev-server + this
+against a live server. run_e2e_postgres.sh orchestrates postgres + dev-server + this
 script for a one-command reproduction.
 """
 import datetime as dt
