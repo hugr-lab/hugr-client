@@ -35,4 +35,4 @@ __all__ = [
     "new_stream_connection",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
