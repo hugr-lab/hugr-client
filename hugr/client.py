@@ -511,21 +511,46 @@ def _encode_geojson(val, fmt):
 class HugrIPCResponse:
     _parts: Dict[str, Union[HugrIPCTable, HugrIPCObject]]
     _extensions: Dict[str, HugrIPCObject]
+    _errors: List[Any]
 
     def __init__(self, response: requests.Response):
-        self._parts, self._extensions = self._parse_multipart(response)
+        self._parts, self._extensions, self._errors = self._parse_multipart(response)
+        # Fail fast on an errors-only response (e.g. a GraphQL syntax
+        # error): the server returns just an `errors` part and no data,
+        # so raising here stops the caller mistaking it for an empty
+        # result. A partial response (data + errors) is returned with
+        # `.errors` populated — call `.raise_for_errors()` to surface
+        # those too.
+        if self._errors and not self._parts:
+            raise ValueError(f"GraphQL errors: {self._error_text()}")
 
     def _parse_multipart(self, response: requests.Response):
         data = decoder.MultipartDecoder.from_response(response)
         parts: Dict[str, Union[HugrIPCTable, HugrIPCObject]] = {}
         extensions: Dict[str, HugrIPCObject] = {}
+        errors: List[Any] = []
         for part in data.parts:
             headers = {k.decode(): v.decode() for k, v in part.headers.items()}
             path = headers.get("X-Hugr-Path")
             part_type = headers.get("X-Hugr-Part-Type")
             format = headers.get("X-Hugr-Format")
-            if part_type == "error":
-                raise ValueError(f"Error in part {path}: {part.content.decode()}")
+            if part_type in ("error", "errors"):
+                # The server emits GraphQL errors as a dedicated part with
+                # X-Hugr-Part-Type "errors" (plural — see query-engine
+                # writeErrorsToIPC). Collect rather than raise mid-parse so
+                # a partial-success response keeps its data; __init__ raises
+                # when the response is errors-only.
+                try:
+                    payload = json.loads(part.content)
+                except (ValueError, TypeError):
+                    payload = part.content.decode()
+                # gqlerror.List is a JSON ARRAY — flatten it into the flat
+                # error list; tolerate a bare object / string defensively.
+                if isinstance(payload, list):
+                    errors.extend(payload)
+                else:
+                    errors.append(payload)
+                continue
             if format == "table":
                 if headers.get("X-Hugr-Empty", "false") == "true":
                     parts[path] = HugrIPCTable(path, [], {}, False)
@@ -544,11 +569,31 @@ class HugrIPCResponse:
                 content = json.loads(part.content)
                 extensions[path] = HugrIPCObject(path, content)
 
-        return parts, extensions
+        return parts, extensions, errors
 
     @property
     def parts(self):
         return self._parts
+
+    @property
+    def errors(self) -> List[Any]:
+        """GraphQL errors as a flat list of error objects (the server's
+        `errors` part carries a JSON array). Empty when the query
+        succeeded. An errors-ONLY response raises in __init__; a partial
+        response (data + errors) is returned with this populated."""
+        return self._errors
+
+    def raise_for_errors(self):
+        """Raise ValueError if the response carries ANY GraphQL errors —
+        use after a query to make a partial-success response fail loud."""
+        if self._errors:
+            raise ValueError(f"GraphQL errors: {self._error_text()}")
+
+    def _error_text(self) -> str:
+        try:
+            return json.dumps(self._errors, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(self._errors)
 
     def __iter__(self):
         return iter(self._parts.keys())
