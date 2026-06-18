@@ -800,41 +800,46 @@ class HugrClient:
         )
         self._tls_skip_verify = tls_skip_verify
 
-        # Priority 1: named connection from connections.json
+        # Priority 1: a connection passed explicitly always wins.
         if connection is not None:
             self._apply_connection(connection if isinstance(connection, str) else None,
                                    connection if isinstance(connection, dict) else None,
                                    url, api_key, api_key_header, token, role, tls_skip_verify)
         else:
-            # Priority 2: default connection from connections.json
-            if not url:
-                try:
-                    from .connections import get_connection
-                    conn = get_connection()
-                    self._apply_connection(None, conn, url, api_key, api_key_header, token, role, tls_skip_verify)
-                    return
-                except (ValueError, FileNotFoundError):
-                    pass
-            # Priority 3: env vars
+            # Priority 2: explicit url= arg, or HUGR_URL / HUGR_TOKEN env.
+            # Inside a headless runtime (e.g. hugen injects HUGR_URL +
+            # HUGR_TOKEN per call) these MUST take precedence over any
+            # ~/.hugr/connections.json that happens to exist on the host —
+            # otherwise a stale default connection shadows the injected
+            # credentials and every call 401s.
             if not url:
                 url = os.environ.get("HUGR_URL")
-            if not url:
+            if url:
+                if not api_key and not token:
+                    api_key = os.environ.get("HUGR_API_KEY")
+                    token = os.environ.get("HUGR_TOKEN")
+                self._url = url
+                self._api_key = api_key
+                self._token = token
+                self._role = role
+                self._api_key_header = (
+                    api_key_header
+                    or os.environ.get("HUGR_API_KEY_HEADER", "X-Hugr-Api-Key")
+                )
+                self._role_header = os.environ.get("HUGR_ROLE_HEADER", "X-Hugr-Role")
+                return
+            # Priority 3: fall back to the default connection in
+            # ~/.hugr/connections.json (interactive / JupyterLab use).
+            try:
+                from .connections import get_connection
+                conn = get_connection()
+                self._apply_connection(None, conn, url, api_key, api_key_header, token, role, tls_skip_verify)
+                return
+            except (ValueError, FileNotFoundError):
                 raise ValueError(
                     "No URL provided. Set HUGR_URL env, pass url=, "
                     "or configure a connection in ~/.hugr/connections.json"
                 )
-            if not api_key and not token:
-                api_key = os.environ.get("HUGR_API_KEY")
-                token = os.environ.get("HUGR_TOKEN")
-            self._url = url
-            self._api_key = api_key
-            self._token = token
-            self._role = role
-            self._api_key_header = (
-                api_key_header
-                or os.environ.get("HUGR_API_KEY_HEADER", "X-Hugr-Api-Key")
-            )
-            self._role_header = os.environ.get("HUGR_ROLE_HEADER", "X-Hugr-Role")
 
     def _apply_connection(self, name, conn_dict, url, api_key, api_key_header, token, role, tls_skip_verify=False):
         """Apply connection config from connections.json, with explicit args taking priority."""
