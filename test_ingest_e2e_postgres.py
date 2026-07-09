@@ -205,7 +205,7 @@ def test_streaming_memory(url: str, query_url: str):
     approx_total_mb = num_batches * rows_per_batch * payload_bytes / (1024 * 1024)
     expected_rows = num_batches * rows_per_batch
 
-    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mem_ingest_worker.py")
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "e2e_ingest_memory_worker.py")
     proc = subprocess.run(
         [sys.executable, worker, url, "pg_ingest.events",
          str(num_batches), str(rows_per_batch), str(payload_bytes)],

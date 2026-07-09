@@ -8,7 +8,7 @@ Run in a fresh subprocess so peak RSS reflects only this work, not whatever
 the parent test process already allocated.
 
 Usage:
-    python mem_ingest_worker.py URL DATA_OBJECT NUM_BATCHES ROWS_PER_BATCH PAYLOAD_BYTES
+    python e2e_ingest_memory_worker.py URL DATA_OBJECT NUM_BATCHES ROWS_PER_BATCH PAYLOAD_BYTES
 """
 import datetime as dt
 import json
