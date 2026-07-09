@@ -9,6 +9,7 @@ import numpy as np
 import json
 import io
 import os
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from requests_toolbelt.multipart import decoder
 from shapely import wkb
 from shapely.geometry import shape, mapping
@@ -933,6 +934,96 @@ class HugrClient:
         resp.raise_for_status()
         return HugrIPCResponse(resp)
 
+    def ingest(self, data_object: str, data) -> dict:
+        """Bulk-insert tabular data into a hugr data object via /ipc/ingest.
+
+        The data is serialised as an Apache Arrow IPC stream and streamed to
+        the server batch-by-batch (chunked transfer encoding), which resolves
+        the columns against the target table's schema and runs a single
+        INSERT ... SELECT. Dramatically faster than row-by-row GraphQL
+        `insert_*` mutations for bulk loads.
+
+        Args:
+            data_object: dotted GraphQL Query path (e.g. "pg_store.public.events")
+                or a bare hugr type name.
+            data: one of
+                - pandas.DataFrame
+                - pyarrow.Table
+                - pyarrow.RecordBatch
+                - pyarrow.RecordBatchReader — consumed lazily, one batch at a
+                  time, so a reader backed by a file/stream larger than RAM is
+                  ingested with bounded (~one batch) memory.
+
+        Returns:
+            dict with keys "data_object", "inserted" (int), "columns" (list).
+
+        Notes:
+            - The request body is a single-use stream. A 401 is surfaced as an
+              error (no automatic token-refresh retry, since the body cannot be
+              replayed) — re-auth and call again.
+            - Arrow column names must match insertable fields of the target
+              table; computed/virtual/reference fields are rejected server-side.
+            - INSERT only — no upsert/merge/on-conflict in this version.
+            - GeoDataFrame is not supported yet: encode geometry columns to WKB
+              and pass a plain DataFrame / pyarrow.Table.
+        """
+        if not data_object:
+            raise ValueError("data_object is required")
+
+        schema, batches = _to_batches(data)
+
+        url = self._ingest_url(data_object)
+        headers = self._ingest_headers()
+        verify = not self._tls_skip_verify
+        if self._tls_skip_verify:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        body = _arrow_ipc_stream_gen(schema, batches)
+        resp = requests.post(url, headers=headers, data=body, verify=verify)
+
+        if resp.status_code == 401:
+            raise PermissionError(
+                "Authentication failed (401). Token expired or invalid. "
+                "Re-login via connection manager or check credentials."
+            )
+        if resp.status_code == 403:
+            raise PermissionError("Access denied (403). Insufficient permissions.")
+        if resp.status_code >= 400:
+            msg = resp.text
+            try:
+                msg = resp.json().get("error", msg)
+            except Exception:
+                pass
+            raise ValueError(f"Ingest failed ({resp.status_code}): {msg}")
+
+        return resp.json()
+
+    def _ingest_url(self, data_object: str) -> str:
+        """Derive the /ipc/ingest endpoint from the client's base /ipc URL."""
+        parts = urlsplit(self._url)
+        path = parts.path.rstrip("/")
+        if path.endswith("/ipc/ingest"):
+            pass
+        elif path.endswith("/ipc"):
+            path = path + "/ingest"
+        else:
+            path = path + "/ipc/ingest"
+        q = dict(parse_qsl(parts.query))
+        q["data_object"] = data_object
+        return urlunsplit((parts.scheme, parts.netloc, path, urlencode(q), parts.fragment))
+
+    def _ingest_headers(self):
+        headers = {"Content-Type": "application/vnd.apache.arrow.stream"}
+        if self._api_key:
+            headers[self._api_key_header] = self._api_key
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        if self._role:
+            headers[self._role_header] = self._role
+        if self._timezone:
+            headers[self._timezone_header] = self._timezone
+        return headers
+
     def __repr__(self):
         return f"HugrClient(url={self._url}, api_key={self._api_key}, token={self._token}, role={self._role})"
 
@@ -964,6 +1055,129 @@ def connect(
 ):
     return HugrClient(url, api_key, api_key_header, token, role,
                        timezone=timezone, timezone_header=timezone_header)
+
+
+def _to_batches(data):
+    """Coerce supported inputs into (schema, batches_iterable).
+
+    For in-memory inputs (DataFrame/Table/RecordBatch) the iterable is a list
+    of zero-copy batches. For a pyarrow.RecordBatchReader the reader itself is
+    returned, so it is consumed lazily — never materialised in full.
+    """
+    # GeoDataFrame is a pandas.DataFrame subclass — check it first and reject
+    # with a clear message, otherwise from_pandas would mangle the geometry.
+    if isinstance(data, gpd.GeoDataFrame):
+        raise NotImplementedError(
+            "GeoDataFrame ingestion is not supported yet; encode geometry "
+            "columns to WKB and pass a plain DataFrame or pyarrow.Table"
+        )
+    if isinstance(data, pa.Table):
+        return data.schema, data.to_batches()
+    if isinstance(data, pa.RecordBatch):
+        return data.schema, [data]
+    if isinstance(data, pa.RecordBatchReader):
+        # Lazy: the reader is iterated one batch at a time by the stream
+        # generator; we never call read_all().
+        return data.schema, data
+    if isinstance(data, pd.DataFrame):
+        # preserve_index=False so we don't emit an __index_level_0__ column
+        # that won't match the target table's schema.
+        table = pa.Table.from_pandas(data, preserve_index=False)
+        return table.schema, table.to_batches()
+    raise TypeError(
+        f"Unsupported data type for ingest: {type(data).__name__}. "
+        "Expected pandas.DataFrame, pyarrow.Table, pyarrow.RecordBatch, "
+        "or pyarrow.RecordBatchReader."
+    )
+
+
+class _IpcStreamSink:
+    """Minimal write-only file-like that buffers Arrow IPC writer output so a
+    generator can drain it incrementally. tell() returns a running byte count
+    (the IPC stream writer is sequential; we never seek), which avoids the
+    ESPIPE a real pipe would raise."""
+
+    def __init__(self):
+        self._chunks = []
+        self._pos = 0
+
+    def write(self, b):
+        b = bytes(b)
+        self._chunks.append(b)
+        self._pos += len(b)
+        return len(b)
+
+    def flush(self):
+        pass
+
+    def tell(self):
+        return self._pos
+
+    def writable(self):
+        return True
+
+    def readable(self):
+        return False
+
+    def seekable(self):
+        return False
+
+    @property
+    def closed(self):
+        return False
+
+    def close(self):
+        pass
+
+    def drain(self):
+        if not self._chunks:
+            return b""
+        out = b"".join(self._chunks)
+        self._chunks.clear()
+        return out
+
+
+def _arrow_ipc_stream_gen(schema, batches):
+    """Yield an Arrow IPC stream as a sequence of byte chunks, serialising one
+    record batch at a time. Used as a streaming request body so peak memory
+    stays ~one batch regardless of total size. requests pulls each chunk
+    lazily and sends it (chunked transfer encoding) before the next batch is
+    serialised."""
+    sink = _IpcStreamSink()
+    writer = pa.ipc.new_stream(sink, schema)
+    # The schema message is written at construction — emit it first.
+    head = sink.drain()
+    if head:
+        yield head
+    try:
+        for batch in batches:
+            writer.write_batch(batch)
+            chunk = sink.drain()
+            if chunk:
+                yield chunk
+    finally:
+        writer.close()
+    tail = sink.drain()
+    if tail:
+        yield tail
+
+
+def ingest(
+    data_object: str,
+    data,
+    url: str = None,
+    api_key: str = None,
+    api_key_header: str = None,
+    token: str = None,
+    role: str = None,
+    timezone: str = None,
+    timezone_header: str = None,
+) -> dict:
+    """Module-level convenience wrapper around HugrClient.ingest."""
+    client = HugrClient(url=url, api_key=api_key, api_key_header=api_key_header,
+                        token=token, role=role, timezone=timezone,
+                        timezone_header=timezone_header)
+    return client.ingest(data_object, data)
 
 
 def explore_map(
