@@ -512,21 +512,46 @@ def _encode_geojson(val, fmt):
 class HugrIPCResponse:
     _parts: Dict[str, Union[HugrIPCTable, HugrIPCObject]]
     _extensions: Dict[str, HugrIPCObject]
+    _errors: List[Any]
 
     def __init__(self, response: requests.Response):
-        self._parts, self._extensions = self._parse_multipart(response)
+        self._parts, self._extensions, self._errors = self._parse_multipart(response)
+        # Fail fast on an errors-only response (e.g. a GraphQL syntax
+        # error): the server returns just an `errors` part and no data,
+        # so raising here stops the caller mistaking it for an empty
+        # result. A partial response (data + errors) is returned with
+        # `.errors` populated — call `.raise_for_errors()` to surface
+        # those too.
+        if self._errors and not self._parts:
+            raise ValueError(f"GraphQL errors: {self._error_text()}")
 
     def _parse_multipart(self, response: requests.Response):
         data = decoder.MultipartDecoder.from_response(response)
         parts: Dict[str, Union[HugrIPCTable, HugrIPCObject]] = {}
         extensions: Dict[str, HugrIPCObject] = {}
+        errors: List[Any] = []
         for part in data.parts:
             headers = {k.decode(): v.decode() for k, v in part.headers.items()}
             path = headers.get("X-Hugr-Path")
             part_type = headers.get("X-Hugr-Part-Type")
             format = headers.get("X-Hugr-Format")
-            if part_type == "error":
-                raise ValueError(f"Error in part {path}: {part.content.decode()}")
+            if part_type in ("error", "errors"):
+                # The server emits GraphQL errors as a dedicated part with
+                # X-Hugr-Part-Type "errors" (plural — see query-engine
+                # writeErrorsToIPC). Collect rather than raise mid-parse so
+                # a partial-success response keeps its data; __init__ raises
+                # when the response is errors-only.
+                try:
+                    payload = json.loads(part.content)
+                except (ValueError, TypeError):
+                    payload = part.content.decode()
+                # gqlerror.List is a JSON ARRAY — flatten it into the flat
+                # error list; tolerate a bare object / string defensively.
+                if isinstance(payload, list):
+                    errors.extend(payload)
+                else:
+                    errors.append(payload)
+                continue
             if format == "table":
                 if headers.get("X-Hugr-Empty", "false") == "true":
                     parts[path] = HugrIPCTable(path, [], {}, False)
@@ -545,11 +570,31 @@ class HugrIPCResponse:
                 content = json.loads(part.content)
                 extensions[path] = HugrIPCObject(path, content)
 
-        return parts, extensions
+        return parts, extensions, errors
 
     @property
     def parts(self):
         return self._parts
+
+    @property
+    def errors(self) -> List[Any]:
+        """GraphQL errors as a flat list of error objects (the server's
+        `errors` part carries a JSON array). Empty when the query
+        succeeded. An errors-ONLY response raises in __init__; a partial
+        response (data + errors) is returned with this populated."""
+        return self._errors
+
+    def raise_for_errors(self):
+        """Raise ValueError if the response carries ANY GraphQL errors —
+        use after a query to make a partial-success response fail loud."""
+        if self._errors:
+            raise ValueError(f"GraphQL errors: {self._error_text()}")
+
+    def _error_text(self) -> str:
+        try:
+            return json.dumps(self._errors, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(self._errors)
 
     def __iter__(self):
         return iter(self._parts.keys())
@@ -756,41 +801,46 @@ class HugrClient:
         )
         self._tls_skip_verify = tls_skip_verify
 
-        # Priority 1: named connection from connections.json
+        # Priority 1: a connection passed explicitly always wins.
         if connection is not None:
             self._apply_connection(connection if isinstance(connection, str) else None,
                                    connection if isinstance(connection, dict) else None,
                                    url, api_key, api_key_header, token, role, tls_skip_verify)
         else:
-            # Priority 2: default connection from connections.json
-            if not url:
-                try:
-                    from .connections import get_connection
-                    conn = get_connection()
-                    self._apply_connection(None, conn, url, api_key, api_key_header, token, role, tls_skip_verify)
-                    return
-                except (ValueError, FileNotFoundError):
-                    pass
-            # Priority 3: env vars
+            # Priority 2: explicit url= arg, or HUGR_URL / HUGR_TOKEN env.
+            # Inside a headless runtime (e.g. hugen injects HUGR_URL +
+            # HUGR_TOKEN per call) these MUST take precedence over any
+            # ~/.hugr/connections.json that happens to exist on the host —
+            # otherwise a stale default connection shadows the injected
+            # credentials and every call 401s.
             if not url:
                 url = os.environ.get("HUGR_URL")
-            if not url:
+            if url:
+                if not api_key and not token:
+                    api_key = os.environ.get("HUGR_API_KEY")
+                    token = os.environ.get("HUGR_TOKEN")
+                self._url = url
+                self._api_key = api_key
+                self._token = token
+                self._role = role
+                self._api_key_header = (
+                    api_key_header
+                    or os.environ.get("HUGR_API_KEY_HEADER", "X-Hugr-Api-Key")
+                )
+                self._role_header = os.environ.get("HUGR_ROLE_HEADER", "X-Hugr-Role")
+                return
+            # Priority 3: fall back to the default connection in
+            # ~/.hugr/connections.json (interactive / JupyterLab use).
+            try:
+                from .connections import get_connection
+                conn = get_connection()
+                self._apply_connection(None, conn, url, api_key, api_key_header, token, role, tls_skip_verify)
+                return
+            except (ValueError, FileNotFoundError):
                 raise ValueError(
                     "No URL provided. Set HUGR_URL env, pass url=, "
                     "or configure a connection in ~/.hugr/connections.json"
                 )
-            if not api_key and not token:
-                api_key = os.environ.get("HUGR_API_KEY")
-                token = os.environ.get("HUGR_TOKEN")
-            self._url = url
-            self._api_key = api_key
-            self._token = token
-            self._role = role
-            self._api_key_header = (
-                api_key_header
-                or os.environ.get("HUGR_API_KEY_HEADER", "X-Hugr-Api-Key")
-            )
-            self._role_header = os.environ.get("HUGR_ROLE_HEADER", "X-Hugr-Role")
 
     def _apply_connection(self, name, conn_dict, url, api_key, api_key_header, token, role, tls_skip_verify=False):
         """Apply connection config from connections.json, with explicit args taking priority."""
